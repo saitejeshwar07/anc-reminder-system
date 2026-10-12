@@ -2,3 +2,8 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# Patient data must never be committed
+data/*.db
+data/*.db-shm
+data/*.db-wal

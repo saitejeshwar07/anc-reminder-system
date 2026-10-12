@@ -1,6 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const dates = require('../lib/dates');
+const { resolveDating, normalizePhone } = require('../lib/dating');
+const reminders = require('../services/reminders');
+
+// Wraps a handler so thrown errors (incl. httpError) reach the error middleware.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 function computeBmi(heightCm, weightKg) {
   if (!heightCm || !weightKg) return null;
@@ -8,165 +14,213 @@ function computeBmi(heightCm, weightKg) {
   return +(weightKg / (h * h)).toFixed(1);
 }
 
-function minus48h(dateStr) {
-  // dateStr: 'YYYY-MM-DD' -> ISO datetime 48h earlier, at 09:00 local time of that day
-  const d = new Date(`${dateStr}T09:00:00`);
-  d.setHours(d.getHours() - 48);
-  return d.toISOString();
+const bool = (v) => (v === true || v === 1 || v === '1' || v === 'true' ? 1 : 0);
+const numOrNull = (v) => (v === undefined || v === null || v === '' || Number.isNaN(Number(v)) ? null : Number(v));
+const textOrNull = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());
+
+function patientView(p, todayStr = dates.today()) {
+  const ga = p.reference_lmp ? dates.gestationalAge(p.reference_lmp, todayStr) : null;
+  return {
+    ...p,
+    ga_weeks: ga ? ga.weeks : null,
+    ga_days: ga ? ga.days : null,
+    expected_delivery: p.reference_lmp ? dates.addDays(p.reference_lmp, 280) : null,
+  };
 }
 
-// ---- Patients ----
+function loadVisits(patientId, todayStr) {
+  const visits = db.prepare(`
+    SELECT * FROM visits WHERE patient_id = ?
+    ORDER BY visit_no IS NULL, visit_no, scheduled_date
+  `).all(patientId);
+  const attempts = db.prepare('SELECT * FROM reminder_attempts WHERE patient_id = ? ORDER BY visit_id, attempt_no').all(patientId);
+  return visits.map((v) => reminders.decorateVisit(v, attempts.filter((a) => a.visit_id === v.id), todayStr));
+}
 
-// Create patient
+// ---- Patients ----------------------------------------------------------------
+
 router.post('/patients', (req, res) => {
-  const b = req.body;
-  const required = ['registration_id', 'full_name', 'phone_number', 'study_group', 'consent_given'];
-  for (const f of required) {
-    if (b[f] === undefined || b[f] === null || b[f] === '') {
+  const b = req.body || {};
+  for (const f of ['registration_id', 'full_name', 'phone_number', 'study_group']) {
+    if (b[f] === undefined || b[f] === null || String(b[f]).trim() === '') {
       return res.status(400).json({ error: `Missing required field: ${f}` });
     }
   }
-  if (!/^\+\d{10,15}$/.test(b.phone_number)) {
-    return res.status(400).json({ error: 'phone_number must be in E.164 format, e.g. +91XXXXXXXXXX' });
-  }
+  const phone = normalizePhone(b.phone_number);
+  if (!phone) return res.status(400).json({ error: 'Enter a valid mobile number, e.g. 9876543210 or +919876543210.' });
   if (!['intervention', 'control'].includes(b.study_group)) {
     return res.status(400).json({ error: "study_group must be 'intervention' or 'control'" });
   }
+  if (b.age !== undefined && b.age !== null && b.age !== '' && !(Number(b.age) >= 10 && Number(b.age) <= 60)) {
+    return res.status(400).json({ error: 'Age looks wrong (expected 10–60).' });
+  }
+  if (b.study_group === 'intervention' && !bool(b.consent_given)) {
+    return res.status(400).json({ error: 'Written informed consent is required before a patient can receive reminder calls.' });
+  }
 
-  const bmi = computeBmi(b.height_cm, b.weight_kg);
+  const now = new Date();
+  const todayStr = dates.today(now);
+  let dating;
+  try {
+    dating = resolveDating(b, todayStr);
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message });
+  }
 
   try {
-    const stmt = db.prepare(`
+    const info = db.prepare(`
       INSERT INTO patients (
         registration_id, full_name, age, phone_number, language,
-        lmp_date, edd_date, gestational_age_weeks,
+        lmp_date, edd_date, gestational_age_weeks, reference_lmp, dating_source,
         height_cm, weight_kg, bmi, occupation, obstetric_history, personal_history,
-        study_group, consent_given, high_risk, hearing_impairment
+        study_group, consent_given, high_risk, hearing_impairment, enrolled_at
       ) VALUES (@registration_id, @full_name, @age, @phone_number, @language,
-        @lmp_date, @edd_date, @gestational_age_weeks,
+        @lmp_date, @edd_date, @gestational_age_weeks, @reference_lmp, @dating_source,
         @height_cm, @weight_kg, @bmi, @occupation, @obstetric_history, @personal_history,
-        @study_group, @consent_given, @high_risk, @hearing_impairment)
-    `);
-    const info = stmt.run({
-      registration_id: b.registration_id,
-      full_name: b.full_name,
-      age: b.age ?? null,
-      phone_number: b.phone_number,
+        @study_group, @consent_given, @high_risk, @hearing_impairment, @enrolled_at)
+    `).run({
+      registration_id: String(b.registration_id).trim(),
+      full_name: String(b.full_name).trim(),
+      age: numOrNull(b.age),
+      phone_number: phone,
       language: b.language || 'or',
-      lmp_date: b.lmp_date ?? null,
-      edd_date: b.edd_date ?? null,
-      gestational_age_weeks: b.gestational_age_weeks ?? null,
-      height_cm: b.height_cm ?? null,
-      weight_kg: b.weight_kg ?? null,
-      bmi,
-      occupation: b.occupation ?? null,
-      obstetric_history: b.obstetric_history ?? null,
-      personal_history: b.personal_history ?? null,
+      lmp_date: textOrNull(b.lmp_date),
+      edd_date: textOrNull(b.edd_date),
+      gestational_age_weeks: numOrNull(b.gestational_age_weeks),
+      reference_lmp: dating.reference_lmp,
+      dating_source: dating.dating_source,
+      height_cm: numOrNull(b.height_cm),
+      weight_kg: numOrNull(b.weight_kg),
+      bmi: computeBmi(numOrNull(b.height_cm), numOrNull(b.weight_kg)),
+      occupation: textOrNull(b.occupation),
+      obstetric_history: textOrNull(b.obstetric_history),
+      personal_history: textOrNull(b.personal_history),
       study_group: b.study_group,
-      consent_given: b.consent_given ? 1 : 0,
-      high_risk: b.high_risk ? 1 : 0,
-      hearing_impairment: b.hearing_impairment ? 1 : 0,
+      consent_given: bool(b.consent_given),
+      high_risk: bool(b.high_risk),
+      hearing_impairment: bool(b.hearing_impairment),
+      enrolled_at: now.toISOString(),
     });
     const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(info.lastInsertRowid);
-    res.status(201).json(patient);
+    reminders.generateVisits(patient, dating.reference_lmp, now);
+    res.status(201).json({ ...patientView(patient, todayStr), visits: loadVisits(patient.id, todayStr) });
   } catch (err) {
     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-      return res.status(409).json({ error: 'A patient with this registration_id already exists' });
+      return res.status(409).json({ error: 'A patient with this registration ID already exists.' });
     }
     res.status(500).json({ error: err.message });
   }
 });
 
-// List patients (with optional group filter)
+// List patients (filters: study_group, active, q = name / reg. id / phone)
 router.get('/patients', (req, res) => {
-  const { study_group, active } = req.query;
-  let query = 'SELECT * FROM patients WHERE 1=1';
+  const { study_group, active, q } = req.query;
+  const where = ['1=1'];
   const params = [];
-  if (study_group) { query += ' AND study_group = ?'; params.push(study_group); }
-  if (active !== undefined) { query += ' AND active = ?'; params.push(active === 'true' ? 1 : 0); }
-  query += ' ORDER BY enrolled_at DESC';
-  res.json(db.prepare(query).all(...params));
+  if (study_group) { where.push('p.study_group = ?'); params.push(study_group); }
+  if (active !== undefined && active !== '') { where.push('p.active = ?'); params.push(active === 'true' ? 1 : 0); }
+  if (q) {
+    where.push('(p.full_name LIKE ? OR p.registration_id LIKE ? OR p.phone_number LIKE ?)');
+    const like = `%${String(q).trim()}%`;
+    params.push(like, like, like);
+  }
+  const rows = db.prepare(`
+    SELECT p.*,
+      (SELECT COUNT(*) FROM visits v WHERE v.patient_id = p.id AND v.reminder_state = 'not_responding'
+         AND v.followup_resolved_at IS NULL) AS open_followups,
+      (SELECT MIN(a.due_date) FROM reminder_attempts a
+         JOIN visits v ON v.id = a.visit_id
+        WHERE a.patient_id = p.id AND a.status = 'scheduled' AND a.manual = 0
+          AND v.reminder_state = 'pending') AS next_call_date
+    FROM patients p WHERE ${where.join(' AND ')}
+    ORDER BY p.enrolled_at DESC
+  `).all(...params);
+  const todayStr = dates.today();
+  res.json(rows.map((r) => patientView(r, todayStr)));
 });
 
-// Get one patient with visits + call logs
+// One patient with the full 7-visit timeline
 router.get('/patients/:id', (req, res) => {
   const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id);
   if (!patient) return res.status(404).json({ error: 'Patient not found' });
-  const visits = db.prepare('SELECT * FROM visits WHERE patient_id = ? ORDER BY scheduled_date').all(req.params.id);
-  const visitIds = visits.map(v => v.id);
-  const logs = visitIds.length
-    ? db.prepare(`SELECT * FROM call_logs WHERE visit_id IN (${visitIds.map(() => '?').join(',')}) ORDER BY triggered_at`).all(...visitIds)
-    : [];
-  res.json({ ...patient, visits, call_logs: logs });
+  const todayStr = dates.today();
+  res.json({ ...patientView(patient, todayStr), visits: loadVisits(patient.id, todayStr) });
 });
 
-// Update patient (e.g. mark withdrawn, correct a field)
+// Update a patient. Changing dating or eligibility rebuilds the not-yet-started visits.
 router.patch('/patients/:id', (req, res) => {
   const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id);
   if (!patient) return res.status(404).json({ error: 'Patient not found' });
-  const allowed = ['full_name', 'phone_number', 'language', 'active', 'consent_given', 'weight_kg', 'height_cm'];
+  const b = req.body || {};
   const updates = {};
-  for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
-  if (updates.height_cm || updates.weight_kg) {
+
+  if (b.full_name !== undefined) {
+    if (!String(b.full_name).trim()) return res.status(400).json({ error: 'Name cannot be empty.' });
+    updates.full_name = String(b.full_name).trim();
+  }
+  if (b.phone_number !== undefined) {
+    const phone = normalizePhone(b.phone_number);
+    if (!phone) return res.status(400).json({ error: 'Enter a valid mobile number.' });
+    updates.phone_number = phone;
+  }
+  if (b.language !== undefined) updates.language = b.language;
+  for (const k of ['active', 'consent_given', 'high_risk', 'hearing_impairment']) {
+    if (b[k] !== undefined) updates[k] = bool(b[k]);
+  }
+  for (const k of ['height_cm', 'weight_kg']) if (b[k] !== undefined) updates[k] = numOrNull(b[k]);
+  if (updates.height_cm !== undefined || updates.weight_kg !== undefined) {
     updates.bmi = computeBmi(updates.height_cm ?? patient.height_cm, updates.weight_kg ?? patient.weight_kg);
   }
-  const setClause = Object.keys(updates).map(k => `${k} = @${k}`).join(', ');
-  if (setClause) {
-    db.prepare(`UPDATE patients SET ${setClause} WHERE id = @id`).run({ ...updates, id: req.params.id });
-  }
-  res.json(db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id));
-});
 
-// ---- Visits ----
-
-// Add a scheduled ANC visit or investigation for a patient
-router.post('/patients/:id/visits', (req, res) => {
-  const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id);
-  if (!patient) return res.status(404).json({ error: 'Patient not found' });
-
-  const { visit_type, label, scheduled_date } = req.body;
-  if (!visit_type || !label || !scheduled_date) {
-    return res.status(400).json({ error: 'visit_type, label and scheduled_date are required' });
-  }
-  if (!['anc_visit', 'investigation'].includes(visit_type)) {
-    return res.status(400).json({ error: "visit_type must be 'anc_visit' or 'investigation'" });
+  let redate = false;
+  if (['lmp_date', 'edd_date', 'gestational_age_weeks'].some((k) => b[k] !== undefined)) {
+    const merged = {
+      lmp_date: b.lmp_date !== undefined ? textOrNull(b.lmp_date) : patient.lmp_date,
+      edd_date: b.edd_date !== undefined ? textOrNull(b.edd_date) : patient.edd_date,
+      gestational_age_weeks: b.gestational_age_weeks !== undefined ? numOrNull(b.gestational_age_weeks) : patient.gestational_age_weeks,
+    };
+    try {
+      const enrolDay = dates.today(new Date(patient.enrolled_at));
+      Object.assign(updates, merged, resolveDating(merged, enrolDay));
+      redate = true;
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
   }
 
-  const reminderAt = patient.study_group === 'intervention' ? minus48h(scheduled_date) : null;
+  const eligibilityChanged = ['active', 'consent_given', 'high_risk', 'hearing_impairment']
+    .some((k) => updates[k] !== undefined && updates[k] !== patient[k]);
 
-  const info = db.prepare(`
-    INSERT INTO visits (patient_id, visit_type, label, scheduled_date, reminder_scheduled_for)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(req.params.id, visit_type, label, scheduled_date, reminderAt);
+  const cols = Object.keys(updates);
+  if (cols.length) {
+    db.prepare(`UPDATE patients SET ${cols.map((k) => `${k} = @${k}`).join(', ')} WHERE id = @id`)
+      .run({ ...updates, id: patient.id });
+  }
+  const fresh = db.prepare('SELECT * FROM patients WHERE id = ?').get(patient.id);
+  if ((redate || eligibilityChanged) && fresh.reference_lmp) reminders.generateVisits(fresh, fresh.reference_lmp);
 
-  res.status(201).json(db.prepare('SELECT * FROM visits WHERE id = ?').get(info.lastInsertRowid));
+  const todayStr = dates.today();
+  res.json({ ...patientView(fresh, todayStr), visits: loadVisits(fresh.id, todayStr) });
 });
 
-// Mark a visit's attendance outcome (used for study analysis)
-router.patch('/visits/:id', (req, res) => {
-  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
-  if (!visit) return res.status(404).json({ error: 'Visit not found' });
-  const { attended } = req.body;
-  db.prepare('UPDATE visits SET attended = ? WHERE id = ?').run(attended ? 1 : 0, req.params.id);
-  res.json(db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id));
-});
+// ---- Visits ------------------------------------------------------------------
 
-// Dashboard summary — quick adherence counts for the study
-router.get('/summary', (req, res) => {
-  const byGroup = db.prepare(`
-    SELECT p.study_group,
-           COUNT(DISTINCT p.id) AS patients,
-           SUM(CASE WHEN v.attended = 1 THEN 1 ELSE 0 END) AS attended,
-           SUM(CASE WHEN v.attended = 0 THEN 1 ELSE 0 END) AS missed,
-           SUM(CASE WHEN v.attended IS NULL THEN 1 ELSE 0 END) AS pending
-    FROM patients p
-    LEFT JOIN visits v ON v.patient_id = p.id
-    GROUP BY p.study_group
-  `).all();
-  const callStats = db.prepare(`
-    SELECT status, COUNT(*) AS count FROM call_logs GROUP BY status
-  `).all();
-  res.json({ byGroup, callStats });
-});
+// Attendance: true = attended, false = missed, null = not recorded yet
+router.patch('/visits/:id', wrap(async (req, res) => {
+  const { attended } = req.body || {};
+  if (![true, false, null].includes(attended)) {
+    return res.status(400).json({ error: 'attended must be true, false or null.' });
+  }
+  res.json(reminders.markAttendance(Number(req.params.id), attended));
+}));
+
+// Staff closes a "Not responding" follow-up (called / visited the patient)
+router.post('/visits/:id/resolve', wrap(async (req, res) => {
+  res.json(reminders.resolveFollowup(Number(req.params.id), (req.body || {}).note));
+}));
+
+router.post('/visits/:id/reopen', wrap(async (req, res) => {
+  res.json(reminders.reopenFollowup(Number(req.params.id)));
+}));
 
 module.exports = router;

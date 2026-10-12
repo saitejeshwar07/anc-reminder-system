@@ -2,146 +2,106 @@
 Backend + admin panel for the ICMR-STS 2026 study: *"Effectiveness of AI-Assisted
 Voice Reminders in Improving Antenatal Follow-up..."*
 
-Enter each patient's details once in the admin panel → the system automatically
-places a phone call playing your recorded reminder message 48 hours before every
-scheduled ANC visit or investigation, but **only for patients in the intervention
-group**. Control-group patients are logged the same way but never called, so your
-data stays clean for the trial's comparison.
+Enter a patient once (with her LMP, EDD or gestational age) → the system builds her
+**7-visit ANC schedule** from the hospital protocol and phones her with the recorded
+reminder at the right weeks. Only **intervention** patients are called; control patients
+get the same schedule for attendance tracking but are never called.
 
 ---
 
-## 1. What's actually happening here (no ML needed)
+## 1. The hospital flow
 
-Since the same recorded message plays for every patient, there's no AI voice
-generation involved — this is a **rules engine + telephony API**, which is simpler
-and more reliable than an ML model for this job:
+| Visit | Weeks | Tests |
+|---|---|---|
+| 1 | 6–9 | HIV, HBsAg, HCV, CBC, Urine routine & microscopy, Thyroid profile, OGTT, Obstetric ultrasound |
+| 2 | 10–11 | Double marker test, NT scan |
+| 3 | 14–15 | — (check-up) |
+| 4 | 20–22 | CBC, OGTT, Thyroid profile, Anomaly scan |
+| 5 | 26–28 | — (check-up) |
+| 6 | 30–32 | Growth scan |
+| 7 | 34–36 | CBC, Obstetric ultrasound |
 
-1. Admin enters a patient + her upcoming visit dates.
-2. The server computes `reminder_time = visit_date − 48 hours` and stores it.
-3. A background job checks every 30 minutes for reminders that are now due.
-4. For each due reminder, it calls **Twilio's Voice API**, which dials the
-   patient's number and plays your uploaded `reminder.mp3`.
-5. Twilio reports back call status (answered, no-answer, failed, etc.), which
-   gets logged — useful data for your "acceptability" secondary objective.
+**Three calls per visit**
 
-If you later want the message personalized per patient (name, date spoken aloud),
-that needs Text-to-Speech — say so and this can be extended; not required for
-what you asked for now.
+1. **Call 1** – first week of the window
+2. **Call 2** – the next week (still inside the window)
+3. **Last call** – one week *after* the window ends
+
+Example, visit 3 (weeks 14–15): call in week 14 → call in week 15 → last call in week 16.
+
+* She **listens** (call connected ≥ 10 s) → reminders for that visit stop.
+* **All 3 calls unanswered** → the visit moves to the **Not responding** block with her
+  name, phone, visit, tests and the 3 attempts. Staff contact her another way and press
+  **Follow-up done** (a note is saved). If she is reached later, or attends, it closes by itself.
+* Calls go out 9:00–18:00 hospital time, at most **one call per patient per day**.
+* Staff can place an extra call any time with **Call now**, and record **Attended / Missed**.
+* A patient enrolled when a visit window is already open is handled in person for that visit
+  (no phone calls for it); calls start with the next window.
+
+Not automated: the weekly check-ups at 37–40 weeks from the bottom of the sheet.
+
+**To change a window or test list, edit only `config/schedule.js`.**
 
 ---
 
-## 2. Project structure
+## 2. Structure
 
 ```
-anc-reminder-system/
-├── server.js           # Express app entry point
-├── db.js                # SQLite connection + auto-migration
-├── scheduler.js         # Cron job that fires due reminder calls
-├── migrations/schema.sql
-├── routes/
-│   ├── patients.js      # Patient + visit CRUD, study summary
-│   └── calls.js         # Twilio call trigger, TwiML, status webhook
-├── public/               # Admin panel (plain HTML/CSS/JS, no build step)
-│   ├── admin.html
-│   ├── admin.css
-│   └── admin.js
-├── audio/
-│   └── reminder.mp3     # <-- YOU add your recorded voice message here
-├── .env.example
-└── package.json
+server.js              Express app (+ optional password gate)
+scheduler.js           Runs the call sweep every 10 minutes
+config/schedule.js     The 7 visits, windows, tests and call rule  <-- the protocol
+services/reminders.js  The reminder engine (attempts, Not responding, attendance)
+services/telephony.js  Twilio wrapper, DRY_RUN support
+routes/patients.js     Enrol / update patients, attendance, follow-up actions
+routes/calls.js        Twilio voice + status webhooks, "Call now", dry-run simulator
+routes/reports.js      Today dashboard, Not responding list, summary, CSV export
+lib/                   Date and dating helpers
+migrations/            SQLite schema (applied automatically, once each)
+public/                Admin panel (plain HTML/CSS/JS)
+tests/flow.test.js     End-to-end test of the whole flow:  npm test
 ```
 
 ---
 
-## 3. Local setup
+## 3. Setup
 
-Requirements: Node.js 18+, an internet connection, a Twilio account.
+Requires Node.js 18+.
 
 ```bash
-cd anc-reminder-system
 npm install
-cp .env.example .env
+cp .env.example .env      # then fill it in
+npm start                 # http://localhost:3000
 ```
 
-Drop your recorded message into `audio/reminder.mp3` (see `audio/README.txt`).
+Put your recording at `audio/reminder.mp3`. Optionally add `audio/reminder_or.mp3` (Odia),
+`reminder_hi.mp3`, `reminder_en.mp3` — a patient's language file is used if it exists.
 
-Fill in `.env`:
-```
-PUBLIC_BASE_URL=https://<your-public-url>      # see step 4
-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxx
-TWILIO_AUTH_TOKEN=your_auth_token
-TWILIO_FROM_NUMBER=+1xxxxxxxxxx
-```
+**Try it without Twilio:** set `DRY_RUN=true`, enrol a patient, press **Run calls now** on the
+Today screen, then use **She answered / No answer** to see the flow.
 
-Run it:
-```bash
-npm start
-```
-Open the admin panel at **http://localhost:3000/admin.html**.
+**Existing database:** just start the app — it upgrades itself. Old manually-scheduled visits
+are kept but no longer called.
 
 ---
 
-## 4. Setting up Twilio (real calling)
+## 4. Twilio (real calls)
 
-1. **Create a Twilio account** at twilio.com and verify it.
-2. In the Twilio Console, grab your **Account SID** and **Auth Token**
-   (Console → Account → API keys & tokens) → put these in `.env`.
-3. **Buy/enable a phone number** capable of voice calls
-   (Console → Phone Numbers → Buy a number). For calling Indian mobile numbers
-   reliably, you may need Twilio's India voice permissions enabled, or
-   consider **Exotel** instead (an India-first alternative with a very similar
-   REST API — ask me and I'll swap `routes/calls.js` over to it).
-4. Twilio needs to **reach your server** over the public internet to fetch the
-   TwiML (`/api/voice/reminder`) and post call status (`/api/voice/status`).
-   - **For testing:** run `ngrok http 3000` and put the ngrok HTTPS URL into
-     `PUBLIC_BASE_URL` in `.env`.
-   - **For production:** deploy this app to a server with a real domain
-     (a small VPS, Render, Railway, or your institution's server) and put that
-     domain in `PUBLIC_BASE_URL`.
-5. Restart the server after changing `.env`.
-
-**Test a single call without waiting for the scheduler:** in the admin panel,
-open a patient with a scheduled visit and click **"Trigger now (test)"** next
-to that visit — or call the API directly:
-```bash
-curl -X POST http://localhost:3000/api/visits/1/trigger-call
-```
+1. Create a Twilio account; copy the Account SID and Auth Token into `.env`.
+2. Buy a voice-capable number (enable India voice permissions) → `TWILIO_FROM_NUMBER`.
+3. Twilio must reach your server: `ngrok http 3000` for testing (put the HTTPS URL in
+   `PUBLIC_BASE_URL`), or a real domain in production. Restart after editing `.env`.
+4. Webhooks are verified with Twilio's signature, so `PUBLIC_BASE_URL` must match the URL
+   Twilio calls exactly.
 
 ---
 
-## 5. Hospital-side data captured
+## 5. Data & privacy
 
-Matches the "Data Collection Procedures & Instruments Used" section of your
-proposal: registration ID, name, age, phone, LMP/EDD, gestational age at
-registration, height/weight/BMI (auto-calculated), occupation, obstetric &
-personal history, study group, consent status, and exclusion flags
-(high-risk pregnancy, hearing impairment). Attendance is recorded per visit
-(`attended: yes/no/pending`) for your adherence analysis, and every call
-attempt is logged with its outcome.
+* Data is a local SQLite file (`data/anc.db`, **not** committed to git). Keep the server inside
+  the hospital network and **set `ADMIN_PASSWORD`** — without it anyone who can reach the server
+  can see patient data. Only `/api/voice/*` and `/audio/*` stay open (Twilio needs them).
+* Back up `data/anc.db` regularly.
+* **Summary → Download CSV** exports every visit with its three call results for analysis.
 
-Add/remove fields in `migrations/schema.sql` and the form in `public/admin.html`
-if your hospital's exact intake form differs.
-
----
-
-## 6. Ethics/data handling notes (per your proposal's confidentiality section)
-
-- Patient phone numbers and health data are stored in a local SQLite file —
-  keep the server behind your institution's firewall/VPN, not open to the
-  public internet beyond the two Twilio webhook endpoints.
-- Restrict `/admin.html` and the `/api/*` routes with authentication before
-  real deployment — this build intentionally leaves that out so you can wire
-  it into your institution's existing login system. Ask if you want a basic
-  password gate added.
-- Export data for analysis via `GET /api/summary` or by querying
-  `data/anc.db` directly (it's a standard SQLite file — importable into
-  Excel via any SQLite-to-CSV tool, or opened with DB Browser for SQLite).
-
----
-
-## 7. Next steps you may want
-
-- Multi-language audio files (currently one file for all patients, as requested)
-- SMS fallback if a call goes unanswered (Twilio supports this too)
-- Basic login for the admin panel
-- CSV export button for the study summary
+If `data/anc.db` was committed earlier, remove it from git (keeps your local copy):
+`git rm --cached -r data`

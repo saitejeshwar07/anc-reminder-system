@@ -1,83 +1,95 @@
 const express = require('express');
-const router = express.Router();
-const db = require('../db');
+const fs = require('fs');
+const path = require('path');
 const twilio = require('twilio');
+const db = require('../db');
+const reminders = require('../services/reminders');
+const telephony = require('../services/telephony');
 
-const {
-  TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN,
-  TWILIO_FROM_NUMBER,
-  PUBLIC_BASE_URL, // e.g. https://your-domain.com — must be publicly reachable by Twilio
-} = process.env;
+const router = express.Router();
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const AUDIO_DIR = path.join(__dirname, '..', 'audio');
 
-const client = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)
-  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-  : null;
+// Twilio webhooks must really come from Twilio.
+function requireTwilio(req, res, next) {
+  if (!telephony.validateWebhook(req)) return res.status(403).type('text/plain').send('Invalid signature');
+  next();
+}
 
-// ---- 1. TwiML: what Twilio plays when the call connects ----
-// Same recording for every patient, as requested. Drop your file at
-// public/audio/reminder.mp3 (or reminder_or.mp3 for Odia) and it's served statically.
-router.get('/voice/reminder', (req, res) => {
+// ---- 1. TwiML: what Twilio plays when the patient picks up -------------------
+// One recording for everyone. If audio/reminder_<lang>.mp3 exists it is used for
+// patients with that language (e.g. reminder_or.mp3); otherwise audio/reminder.mp3.
+router.all('/voice/reminder', requireTwilio, (req, res) => {
+  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const attemptId = Number(req.query.attempt) || null;
+  let lang = null;
+  if (attemptId) {
+    const row = db.prepare(`
+      SELECT p.language FROM reminder_attempts a JOIN patients p ON p.id = a.patient_id WHERE a.id = ?
+    `).get(attemptId);
+    lang = row && /^[a-z]{2,3}$/.test(row.language || '') ? row.language : null;
+  }
+  const file = [lang && `reminder_${lang}.mp3`, 'reminder.mp3']
+    .filter(Boolean).find((f) => fs.existsSync(path.join(AUDIO_DIR, f)));
+
   const twiml = new twilio.twiml.VoiceResponse();
-  const audioUrl = `${PUBLIC_BASE_URL}/audio/reminder.mp3`;
-  twiml.play(audioUrl);
-  // Optional: repeat once in case the line was noisy at pickup
-  twiml.pause({ length: 1 });
-  twiml.play(audioUrl);
-  res.type('text/xml');
-  res.send(twiml.toString());
+  if (file) {
+    const url = `${base}/audio/${file}`;
+    twiml.play(url);
+    twiml.pause({ length: 1 });
+    twiml.play(url); // repeated once in case the line was noisy at pickup
+  } else {
+    console.error('[voice] audio/reminder.mp3 is missing — playing a spoken fallback.');
+    twiml.say('This is a reminder from the hospital for your antenatal check-up. Please visit the hospital for your tests. Thank you.');
+  }
+  res.type('text/xml').send(twiml.toString());
 });
 
-// ---- 2. Twilio status callback: call progress updates land here ----
-router.post('/voice/status', (req, res) => {
-  const { CallSid, CallStatus } = req.body;
-  db.prepare(`
-    UPDATE call_logs SET status = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE twilio_call_sid = ?
-  `).run(CallStatus, CallSid);
+// ---- 2. Twilio status callback: call progress -> attempt result ---------------
+router.post('/voice/status', requireTwilio, (req, res) => {
+  const { CallSid, CallStatus, CallDuration } = req.body || {};
+  let attemptId = Number(req.query.attempt) || null;
+  if (!attemptId && CallSid) {
+    const a = db.prepare('SELECT id FROM reminder_attempts WHERE twilio_call_sid = ?').get(CallSid);
+    attemptId = a ? a.id : null;
+  }
+  if (attemptId && CallStatus) {
+    try {
+      reminders.applyCallStatus(attemptId, {
+        status: CallStatus,
+        duration: CallDuration !== undefined && CallDuration !== '' ? Number(CallDuration) : null,
+        sid: CallSid || null,
+      });
+    } catch (err) {
+      console.error(`[voice] status update failed for attempt ${attemptId}: ${err.message}`);
+    }
+  }
   res.sendStatus(204);
 });
 
-// ---- 3. Trigger a single reminder call for a given visit ----
-// Called by the scheduler automatically, or manually for testing.
-async function triggerCallForVisit(visitId) {
-  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
-  if (!visit) throw new Error('Visit not found');
-  const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(visit.patient_id);
-  if (!patient) throw new Error('Patient not found');
+// ---- 3. Staff actions ---------------------------------------------------------
 
-  if (!client) {
-    throw new Error('Twilio is not configured. Set TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER in .env');
-  }
+// "Call now": an extra, manual call for one visit.
+router.post('/visits/:id/call-now', wrap(async (req, res) => {
+  res.json(await reminders.manualCall(Number(req.params.id)));
+}));
 
-  const attemptNumber = db.prepare('SELECT COUNT(*) AS c FROM call_logs WHERE visit_id = ?').get(visitId).c + 1;
+// Dry-run only: finish a pretend call so the whole flow can be demonstrated without Twilio.
+router.post('/attempts/:id/simulate', wrap(async (req, res) => {
+  if (!telephony.isDryRun()) throw reminders.httpError(400, 'Simulation is only available when DRY_RUN=true.');
+  const outcome = (req.body || {}).outcome;
+  if (!['answered', 'unanswered'].includes(outcome)) throw reminders.httpError(400, "outcome must be 'answered' or 'unanswered'.");
+  const ok = reminders.applyCallStatus(Number(req.params.id), outcome === 'answered'
+    ? { status: 'completed', duration: 45 }
+    : { status: 'no-answer', duration: 0 });
+  if (!ok) throw reminders.httpError(409, 'That call is not in progress.');
+  res.json({ ok: true });
+}));
 
-  const call = await client.calls.create({
-    to: patient.phone_number,
-    from: TWILIO_FROM_NUMBER,
-    url: `${PUBLIC_BASE_URL}/api/voice/reminder`,
-    statusCallback: `${PUBLIC_BASE_URL}/api/voice/status`,
-    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-  });
+// Run the scheduler pass now (dry-run demos can also ignore calling hours).
+router.post('/sweep', wrap(async (req, res) => {
+  const ignoreHours = telephony.isDryRun() && (req.body || {}).ignoreHours === true;
+  res.json(await reminders.runSweep({ ignoreHours }));
+}));
 
-  db.prepare(`
-    INSERT INTO call_logs (visit_id, patient_id, twilio_call_sid, status, attempt_number)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(visitId, patient.id, call.sid, call.status, attemptNumber);
-
-  db.prepare('UPDATE visits SET reminder_sent = 1 WHERE id = ?').run(visitId);
-
-  return call;
-}
-
-// Manual/test trigger endpoint — lets the admin fire a reminder call on demand
-router.post('/visits/:id/trigger-call', async (req, res) => {
-  try {
-    const call = await triggerCallForVisit(req.params.id);
-    res.json({ ok: true, callSid: call.sid, status: call.status });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-module.exports = { router, triggerCallForVisit };
+module.exports = { router };

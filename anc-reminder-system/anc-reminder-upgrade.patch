@@ -1,0 +1,3088 @@
+diff --git a/anc-reminder-system/.env.example b/anc-reminder-system/.env.example
+new file mode 100644
+index 0000000..e009d74
+--- /dev/null
++++ b/anc-reminder-system/.env.example
+@@ -0,0 +1,25 @@
++# ---- Server ----
++PORT=3000
++# Public HTTPS address Twilio can reach (ngrok URL while testing, your domain in production)
++PUBLIC_BASE_URL=https://your-public-url.example.com
++
++# ---- Twilio ----
++TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
++TWILIO_AUTH_TOKEN=your_auth_token
++TWILIO_FROM_NUMBER=+1xxxxxxxxxx
++
++# ---- Admin login (recommended). Leave empty only on a closed local machine. ----
++ADMIN_USER=admin
++ADMIN_PASSWORD=
++
++# ---- Reminder rules ----
++APP_TIMEZONE=Asia/Kolkata
++# Calls are only placed between these hours (24h clock, hospital time)
++CALL_WINDOW_START_HOUR=9
++CALL_WINDOW_END_HOUR=18
++# A call counts as "listened" if it lasted at least this many seconds
++MIN_ANSWER_SECONDS=10
++
++# ---- Testing ----
++# true = place no real calls; use the "She answered / No answer" buttons in the admin panel
++DRY_RUN=false
+diff --git a/anc-reminder-system/.gitignore b/anc-reminder-system/.gitignore
+index 98ce201..7275055 100644
+--- a/anc-reminder-system/.gitignore
++++ b/anc-reminder-system/.gitignore
+@@ -1,4 +1,9 @@
+ node_modules/
+ .env
+ .env.*
+-!.env.example
+\ No newline at end of file
++!.env.example
++
++# Patient data must never be committed
++data/*.db
++data/*.db-shm
++data/*.db-wal
+diff --git a/anc-reminder-system/README.md b/anc-reminder-system/README.md
+index c8afd1b..29dcc2e 100644
+--- a/anc-reminder-system/README.md
++++ b/anc-reminder-system/README.md
+@@ -2,146 +2,106 @@
+ Backend + admin panel for the ICMR-STS 2026 study: *"Effectiveness of AI-Assisted
+ Voice Reminders in Improving Antenatal Follow-up..."*
+ 
+-Enter each patient's details once in the admin panel → the system automatically
+-places a phone call playing your recorded reminder message 48 hours before every
+-scheduled ANC visit or investigation, but **only for patients in the intervention
+-group**. Control-group patients are logged the same way but never called, so your
+-data stays clean for the trial's comparison.
++Enter a patient once (with her LMP, EDD or gestational age) → the system builds her
++**7-visit ANC schedule** from the hospital protocol and phones her with the recorded
++reminder at the right weeks. Only **intervention** patients are called; control patients
++get the same schedule for attendance tracking but are never called.
+ 
+ ---
+ 
+-## 1. What's actually happening here (no ML needed)
++## 1. The hospital flow
+ 
+-Since the same recorded message plays for every patient, there's no AI voice
+-generation involved — this is a **rules engine + telephony API**, which is simpler
+-and more reliable than an ML model for this job:
++| Visit | Weeks | Tests |
++|---|---|---|
++| 1 | 6–9 | HIV, HBsAg, HCV, CBC, Urine routine & microscopy, Thyroid profile, OGTT, Obstetric ultrasound |
++| 2 | 10–11 | Double marker test, NT scan |
++| 3 | 14–15 | — (check-up) |
++| 4 | 20–22 | CBC, OGTT, Thyroid profile, Anomaly scan |
++| 5 | 26–28 | — (check-up) |
++| 6 | 30–32 | Growth scan |
++| 7 | 34–36 | CBC, Obstetric ultrasound |
+ 
+-1. Admin enters a patient + her upcoming visit dates.
+-2. The server computes `reminder_time = visit_date − 48 hours` and stores it.
+-3. A background job checks every 30 minutes for reminders that are now due.
+-4. For each due reminder, it calls **Twilio's Voice API**, which dials the
+-   patient's number and plays your uploaded `reminder.mp3`.
+-5. Twilio reports back call status (answered, no-answer, failed, etc.), which
+-   gets logged — useful data for your "acceptability" secondary objective.
++**Three calls per visit**
+ 
+-If you later want the message personalized per patient (name, date spoken aloud),
+-that needs Text-to-Speech — say so and this can be extended; not required for
+-what you asked for now.
++1. **Call 1** – first week of the window
++2. **Call 2** – the next week (still inside the window)
++3. **Last call** – one week *after* the window ends
++
++Example, visit 3 (weeks 14–15): call in week 14 → call in week 15 → last call in week 16.
++
++* She **listens** (call connected ≥ 10 s) → reminders for that visit stop.
++* **All 3 calls unanswered** → the visit moves to the **Not responding** block with her
++  name, phone, visit, tests and the 3 attempts. Staff contact her another way and press
++  **Follow-up done** (a note is saved). If she is reached later, or attends, it closes by itself.
++* Calls go out 9:00–18:00 hospital time, at most **one call per patient per day**.
++* Staff can place an extra call any time with **Call now**, and record **Attended / Missed**.
++* A patient enrolled when a visit window is already open is handled in person for that visit
++  (no phone calls for it); calls start with the next window.
++
++Not automated: the weekly check-ups at 37–40 weeks from the bottom of the sheet.
++
++**To change a window or test list, edit only `config/schedule.js`.**
+ 
+ ---
+ 
+-## 2. Project structure
++## 2. Structure
+ 
+ ```
+-anc-reminder-system/
+-├── server.js           # Express app entry point
+-├── db.js                # SQLite connection + auto-migration
+-├── scheduler.js         # Cron job that fires due reminder calls
+-├── migrations/schema.sql
+-├── routes/
+-│   ├── patients.js      # Patient + visit CRUD, study summary
+-│   └── calls.js         # Twilio call trigger, TwiML, status webhook
+-├── public/               # Admin panel (plain HTML/CSS/JS, no build step)
+-│   ├── admin.html
+-│   ├── admin.css
+-│   └── admin.js
+-├── audio/
+-│   └── reminder.mp3     # <-- YOU add your recorded voice message here
+-├── .env.example
+-└── package.json
++server.js              Express app (+ optional password gate)
++scheduler.js           Runs the call sweep every 10 minutes
++config/schedule.js     The 7 visits, windows, tests and call rule  <-- the protocol
++services/reminders.js  The reminder engine (attempts, Not responding, attendance)
++services/telephony.js  Twilio wrapper, DRY_RUN support
++routes/patients.js     Enrol / update patients, attendance, follow-up actions
++routes/calls.js        Twilio voice + status webhooks, "Call now", dry-run simulator
++routes/reports.js      Today dashboard, Not responding list, summary, CSV export
++lib/                   Date and dating helpers
++migrations/            SQLite schema (applied automatically, once each)
++public/                Admin panel (plain HTML/CSS/JS)
++tests/flow.test.js     End-to-end test of the whole flow:  npm test
+ ```
+ 
+ ---
+ 
+-## 3. Local setup
++## 3. Setup
+ 
+-Requirements: Node.js 18+, an internet connection, a Twilio account.
++Requires Node.js 18+.
+ 
+ ```bash
+-cd anc-reminder-system
+ npm install
+-cp .env.example .env
++cp .env.example .env      # then fill it in
++npm start                 # http://localhost:3000
+ ```
+ 
+-Drop your recorded message into `audio/reminder.mp3` (see `audio/README.txt`).
++Put your recording at `audio/reminder.mp3`. Optionally add `audio/reminder_or.mp3` (Odia),
++`reminder_hi.mp3`, `reminder_en.mp3` — a patient's language file is used if it exists.
+ 
+-Fill in `.env`:
+-```
+-PUBLIC_BASE_URL=https://<your-public-url>      # see step 4
+-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxx
+-TWILIO_AUTH_TOKEN=your_auth_token
+-TWILIO_FROM_NUMBER=+1xxxxxxxxxx
+-```
++**Try it without Twilio:** set `DRY_RUN=true`, enrol a patient, press **Run calls now** on the
++Today screen, then use **She answered / No answer** to see the flow.
+ 
+-Run it:
+-```bash
+-npm start
+-```
+-Open the admin panel at **http://localhost:3000/admin.html**.
++**Existing database:** just start the app — it upgrades itself. Old manually-scheduled visits
++are kept but no longer called.
+ 
+ ---
+ 
+-## 4. Setting up Twilio (real calling)
+-
+-1. **Create a Twilio account** at twilio.com and verify it.
+-2. In the Twilio Console, grab your **Account SID** and **Auth Token**
+-   (Console → Account → API keys & tokens) → put these in `.env`.
+-3. **Buy/enable a phone number** capable of voice calls
+-   (Console → Phone Numbers → Buy a number). For calling Indian mobile numbers
+-   reliably, you may need Twilio's India voice permissions enabled, or
+-   consider **Exotel** instead (an India-first alternative with a very similar
+-   REST API — ask me and I'll swap `routes/calls.js` over to it).
+-4. Twilio needs to **reach your server** over the public internet to fetch the
+-   TwiML (`/api/voice/reminder`) and post call status (`/api/voice/status`).
+-   - **For testing:** run `ngrok http 3000` and put the ngrok HTTPS URL into
+-     `PUBLIC_BASE_URL` in `.env`.
+-   - **For production:** deploy this app to a server with a real domain
+-     (a small VPS, Render, Railway, or your institution's server) and put that
+-     domain in `PUBLIC_BASE_URL`.
+-5. Restart the server after changing `.env`.
+-
+-**Test a single call without waiting for the scheduler:** in the admin panel,
+-open a patient with a scheduled visit and click **"Trigger now (test)"** next
+-to that visit — or call the API directly:
+-```bash
+-curl -X POST http://localhost:3000/api/visits/1/trigger-call
+-```
+-
+----
+-
+-## 5. Hospital-side data captured
++## 4. Twilio (real calls)
+ 
+-Matches the "Data Collection Procedures & Instruments Used" section of your
+-proposal: registration ID, name, age, phone, LMP/EDD, gestational age at
+-registration, height/weight/BMI (auto-calculated), occupation, obstetric &
+-personal history, study group, consent status, and exclusion flags
+-(high-risk pregnancy, hearing impairment). Attendance is recorded per visit
+-(`attended: yes/no/pending`) for your adherence analysis, and every call
+-attempt is logged with its outcome.
+-
+-Add/remove fields in `migrations/schema.sql` and the form in `public/admin.html`
+-if your hospital's exact intake form differs.
++1. Create a Twilio account; copy the Account SID and Auth Token into `.env`.
++2. Buy a voice-capable number (enable India voice permissions) → `TWILIO_FROM_NUMBER`.
++3. Twilio must reach your server: `ngrok http 3000` for testing (put the HTTPS URL in
++   `PUBLIC_BASE_URL`), or a real domain in production. Restart after editing `.env`.
++4. Webhooks are verified with Twilio's signature, so `PUBLIC_BASE_URL` must match the URL
++   Twilio calls exactly.
+ 
+ ---
+ 
+-## 6. Ethics/data handling notes (per your proposal's confidentiality section)
+-
+-- Patient phone numbers and health data are stored in a local SQLite file —
+-  keep the server behind your institution's firewall/VPN, not open to the
+-  public internet beyond the two Twilio webhook endpoints.
+-- Restrict `/admin.html` and the `/api/*` routes with authentication before
+-  real deployment — this build intentionally leaves that out so you can wire
+-  it into your institution's existing login system. Ask if you want a basic
+-  password gate added.
+-- Export data for analysis via `GET /api/summary` or by querying
+-  `data/anc.db` directly (it's a standard SQLite file — importable into
+-  Excel via any SQLite-to-CSV tool, or opened with DB Browser for SQLite).
+-
+----
++## 5. Data & privacy
+ 
+-## 7. Next steps you may want
++* Data is a local SQLite file (`data/anc.db`, **not** committed to git). Keep the server inside
++  the hospital network and **set `ADMIN_PASSWORD`** — without it anyone who can reach the server
++  can see patient data. Only `/api/voice/*` and `/audio/*` stay open (Twilio needs them).
++* Back up `data/anc.db` regularly.
++* **Summary → Download CSV** exports every visit with its three call results for analysis.
+ 
+-- Multi-language audio files (currently one file for all patients, as requested)
+-- SMS fallback if a call goes unanswered (Twilio supports this too)
+-- Basic login for the admin panel
+-- CSV export button for the study summary
++If `data/anc.db` was committed earlier, remove it from git (keeps your local copy):
++`git rm --cached -r data`
+diff --git a/anc-reminder-system/config/schedule.js b/anc-reminder-system/config/schedule.js
+new file mode 100644
+index 0000000..a38ab9e
+--- /dev/null
++++ b/anc-reminder-system/config/schedule.js
+@@ -0,0 +1,73 @@
++// ---------------------------------------------------------------------------
++// ANC visit protocol — the ONE place that defines the 7 visits.
++// Taken from the hospital's handwritten protocol sheet. If the hospital changes
++// a window or a test list, edit it here; nothing else needs to change.
++//
++// Weeks are gestational weeks counted from LMP. A window [startWeek, endWeek]
++// means the visit/tests should happen during those weeks (inclusive).
++//
++// Reminder call rule (same for every visit):
++//   Attempt 1 : first day of the window                (start week)
++//   Attempt 2 : one week later, still inside the window (start week + 1)
++//               -> if the window is a single week, 3 days after attempt 1
++//   Attempt 3 : LAST call, one week after the window ends (end week + 1)
++//   Patient picks up and listens -> reminders for that visit stop.
++//   All 3 attempts unanswered    -> patient goes to the "Not responding" list.
++//
++// Example (visit 3, weeks 14-15): call in week 14, call in week 15,
++// final call in week 16, otherwise -> Not responding.
++//
++// Not automated (not part of the 7 tests): the weekly check-ups at 37, 38, 39
++// and 40 weeks listed at the bottom of the protocol sheet.
++// ---------------------------------------------------------------------------
++const { addDays } = require('../lib/dates');
++
++const MAX_ATTEMPTS = 3;
++const SAME_WEEK_RETRY_DAYS = 3;
++
++const VISITS = [
++  {
++    no: 1, startWeek: 6, endWeek: 9,
++    tests: [
++      'HIV', 'HBsAg', 'HCV', 'CBC', 'Urine routine & microscopy',
++      'Thyroid profile', 'OGTT', 'Obstetric ultrasound',
++    ],
++  },
++  { no: 2, startWeek: 10, endWeek: 11, tests: ['Double marker test', 'NT scan'] },
++  { no: 3, startWeek: 14, endWeek: 15, tests: [] },
++  { no: 4, startWeek: 20, endWeek: 22, tests: ['CBC', 'OGTT', 'Thyroid profile', 'Anomaly scan'] },
++  { no: 5, startWeek: 26, endWeek: 28, tests: [] },
++  { no: 6, startWeek: 30, endWeek: 32, tests: ['Growth scan'] },
++  { no: 7, startWeek: 34, endWeek: 36, tests: ['CBC', 'Obstetric ultrasound'] },
++];
++
++function visitLabel(v) {
++  return `ANC Visit ${v.no}`;
++}
++
++// Day offsets (from LMP) of the three call attempts for a window.
++function attemptOffsets(startWeek, endWeek) {
++  const a1 = startWeek * 7;
++  const a2 = startWeek + 1 <= endWeek ? (startWeek + 1) * 7 : a1 + SAME_WEEK_RETRY_DAYS;
++  const a3 = (endWeek + 1) * 7;
++  return [a1, a2, a3];
++}
++
++// Full plan for a patient with the given LMP (YYYY-MM-DD).
++function buildPlan(lmp) {
++  return VISITS.map((v) => ({
++    visit_no: v.no,
++    label: visitLabel(v),
++    tests: v.tests,
++    window_start_week: v.startWeek,
++    window_end_week: v.endWeek,
++    window_start_date: addDays(lmp, v.startWeek * 7),
++    window_end_date: addDays(lmp, v.endWeek * 7 + 6),
++    attempts: attemptOffsets(v.startWeek, v.endWeek).map((off, i) => ({
++      attempt_no: i + 1,
++      due_date: addDays(lmp, off),
++    })),
++  }));
++}
++
++module.exports = { VISITS, MAX_ATTEMPTS, buildPlan, attemptOffsets, visitLabel };
+diff --git a/anc-reminder-system/db.js b/anc-reminder-system/db.js
+index 7c4fea7..4015c2e 100644
+--- a/anc-reminder-system/db.js
++++ b/anc-reminder-system/db.js
+@@ -9,7 +9,17 @@ const db = new Database(DB_PATH);
+ db.pragma('journal_mode = WAL');
+ db.pragma('foreign_keys = ON');
+ 
+-const schema = fs.readFileSync(path.join(__dirname, 'migrations', 'schema.sql'), 'utf8');
+-db.exec(schema);
++// Ordered migrations. PRAGMA user_version records how many have been applied,
++// so each runs exactly once — including on a database created by an older build.
++const MIGRATIONS = ['schema.sql', '002_reminder_flow.sql'];
++
++const applied = db.pragma('user_version', { simple: true });
++for (let i = applied; i < MIGRATIONS.length; i++) {
++  const sql = fs.readFileSync(path.join(__dirname, 'migrations', MIGRATIONS[i]), 'utf8');
++  db.transaction(() => {
++    db.exec(sql);
++    db.pragma(`user_version = ${i + 1}`);
++  })();
++}
+ 
+ module.exports = db;
+diff --git a/anc-reminder-system/lib/dates.js b/anc-reminder-system/lib/dates.js
+new file mode 100644
+index 0000000..d566404
+--- /dev/null
++++ b/anc-reminder-system/lib/dates.js
+@@ -0,0 +1,64 @@
++// Date helpers. All "calendar day" logic runs in the hospital's timezone
++// (default Asia/Kolkata) so reminders never drift by a day because the server
++// happens to be in UTC. Dates are plain 'YYYY-MM-DD' strings.
++
++const TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
++
++const YMD = /^(\d{4})-(\d{2})-(\d{2})$/;
++
++function isValidYmd(s) {
++  if (typeof s !== 'string') return false;
++  const m = YMD.exec(s);
++  if (!m) return false;
++  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
++  return d.getUTCFullYear() === +m[1] && d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3];
++}
++
++function toUtcDate(ymd) {
++  const m = YMD.exec(ymd);
++  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
++}
++
++function fromUtcDate(d) {
++  return d.toISOString().slice(0, 10);
++}
++
++function addDays(ymd, n) {
++  const d = toUtcDate(ymd);
++  d.setUTCDate(d.getUTCDate() + n);
++  return fromUtcDate(d);
++}
++
++// whole days from a to b (b - a)
++function diffDays(a, b) {
++  return Math.round((toUtcDate(b) - toUtcDate(a)) / 86400000);
++}
++
++// Calendar date + clock hour in the hospital timezone for a given instant.
++function nowParts(now = new Date()) {
++  const parts = new Intl.DateTimeFormat('en-CA', {
++    timeZone: TIMEZONE,
++    year: 'numeric', month: '2-digit', day: '2-digit',
++    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
++  }).formatToParts(now);
++  const get = (t) => parts.find((p) => p.type === t).value;
++  return {
++    date: `${get('year')}-${get('month')}-${get('day')}`,
++    hour: Number(get('hour')),
++    minute: Number(get('minute')),
++  };
++}
++
++function today(now = new Date()) {
++  return nowParts(now).date;
++}
++
++// Gestational age on a given date, from LMP.
++function gestationalAge(lmp, onDate) {
++  const totalDays = diffDays(lmp, onDate);
++  return { totalDays, weeks: Math.floor(totalDays / 7), days: ((totalDays % 7) + 7) % 7 };
++}
++
++module.exports = {
++  TIMEZONE, isValidYmd, addDays, diffDays, nowParts, today, gestationalAge,
++};
+diff --git a/anc-reminder-system/lib/dating.js b/anc-reminder-system/lib/dating.js
+new file mode 100644
+index 0000000..b108c5a
+--- /dev/null
++++ b/anc-reminder-system/lib/dating.js
+@@ -0,0 +1,47 @@
++// Works out the "reference LMP" that every week calculation is based on.
++// Priority: entered LMP  >  EDD - 280 days  >  gestational age at registration.
++const dates = require('./dates');
++
++const MAX_GA_DAYS = 42 * 7;
++
++function bad(msg) { const e = new Error(msg); e.status = 400; return e; }
++
++// input: { lmp_date, edd_date, gestational_age_weeks }
++// enrolDay: YYYY-MM-DD the patient was enrolled (the gestational age field is "at registration")
++function resolveDating(input, enrolDay) {
++  const lmp = input.lmp_date || null;
++  const edd = input.edd_date || null;
++  const gaRaw = input.gestational_age_weeks;
++  const ga = gaRaw === null || gaRaw === undefined || gaRaw === '' ? null : Number(gaRaw);
++
++  let ref; let source;
++  if (lmp) {
++    if (!dates.isValidYmd(lmp)) throw bad('LMP date is not a valid date.');
++    ref = lmp; source = 'lmp';
++  } else if (edd) {
++    if (!dates.isValidYmd(edd)) throw bad('EDD date is not a valid date.');
++    ref = dates.addDays(edd, -280); source = 'edd';
++  } else if (ga !== null) {
++    if (!Number.isFinite(ga) || ga < 0 || ga > 42) throw bad('Gestational age must be between 0 and 42 weeks.');
++    ref = dates.addDays(enrolDay, -Math.round(ga * 7)); source = 'ga';
++  } else {
++    throw bad('Enter the LMP date, the EDD, or the gestational age at registration — the visit schedule is calculated from it.');
++  }
++
++  const days = dates.diffDays(ref, enrolDay);
++  if (days < 0 || days > MAX_GA_DAYS) {
++    throw bad(`These dates give a gestational age of ${Math.floor(days / 7)} weeks at enrolment, which is outside 0–42 weeks. Please check the LMP / EDD.`);
++  }
++  return { reference_lmp: ref, dating_source: source };
++}
++
++// Accepts "+919876543210", "9876543210", "98765 43210" ...
++function normalizePhone(raw) {
++  const s = String(raw || '').replace(/[\s\-().]/g, '');
++  if (/^[6-9]\d{9}$/.test(s)) return `+91${s}`;
++  if (/^0[6-9]\d{9}$/.test(s)) return `+91${s.slice(1)}`;
++  if (/^\+\d{10,15}$/.test(s)) return s;
++  return null;
++}
++
++module.exports = { resolveDating, normalizePhone };
+diff --git a/anc-reminder-system/migrations/002_reminder_flow.sql b/anc-reminder-system/migrations/002_reminder_flow.sql
+new file mode 100644
+index 0000000..804db1d
+--- /dev/null
++++ b/anc-reminder-system/migrations/002_reminder_flow.sql
+@@ -0,0 +1,50 @@
++-- Migration 2: protocol-driven visits + 3-attempt reminder flow.
++-- Runs once (tracked with PRAGMA user_version), so it is safe on databases
++-- that were created with the original schema.
++
++-- Dating: the LMP that all week calculations are based on. It is the entered
++-- LMP, or EDD - 280 days, or (today - gestational age at registration).
++ALTER TABLE patients ADD COLUMN reference_lmp TEXT;
++ALTER TABLE patients ADD COLUMN dating_source TEXT;           -- 'lmp' | 'edd' | 'ga'
++
++-- Visits now come from the 7-visit protocol (config/schedule.js).
++ALTER TABLE visits ADD COLUMN visit_no INTEGER;               -- 1..7 (NULL = legacy manual row)
++ALTER TABLE visits ADD COLUMN window_start_week INTEGER;
++ALTER TABLE visits ADD COLUMN window_end_week INTEGER;
++ALTER TABLE visits ADD COLUMN window_start_date TEXT;         -- YYYY-MM-DD
++ALTER TABLE visits ADD COLUMN window_end_date TEXT;           -- YYYY-MM-DD
++ALTER TABLE visits ADD COLUMN tests TEXT;                     -- JSON array of test names
++-- pending | reached | not_responding | closed | skipped | not_applicable | legacy
++ALTER TABLE visits ADD COLUMN reminder_state TEXT NOT NULL DEFAULT 'legacy';
++ALTER TABLE visits ADD COLUMN flagged_at TEXT;                -- when it entered "Not responding"
++ALTER TABLE visits ADD COLUMN followup_resolved_at TEXT;      -- staff closed the follow-up
++ALTER TABLE visits ADD COLUMN followup_note TEXT;
++
++CREATE UNIQUE INDEX IF NOT EXISTS uq_visits_patient_visitno
++    ON visits(patient_id, visit_no) WHERE visit_no IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_visits_state ON visits(reminder_state);
++
++-- One row per planned (or manual) call attempt. This is the source of truth
++-- for the reminder flow; the old call_logs / reminder_sent columns are legacy.
++CREATE TABLE IF NOT EXISTS reminder_attempts (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    visit_id        INTEGER NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
++    patient_id      INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
++    attempt_no      INTEGER NOT NULL,                 -- 1..3 planned, 4+ = manual extra calls
++    manual          INTEGER NOT NULL DEFAULT 0,
++    due_date        TEXT NOT NULL,                    -- YYYY-MM-DD (hospital timezone)
++    -- scheduled | dialing | answered | unanswered | skipped | cancelled | failed
++    status          TEXT NOT NULL DEFAULT 'scheduled',
++    twilio_call_sid TEXT,
++    call_status     TEXT,                             -- last raw Twilio status
++    duration_sec    INTEGER,
++    placed_at       TEXT,                             -- ISO UTC timestamp
++    placed_on       TEXT,                             -- YYYY-MM-DD, enforces 1 call/patient/day
++    completed_at    TEXT,
++    error_count     INTEGER NOT NULL DEFAULT 0,
++    last_error      TEXT,
++    UNIQUE (visit_id, attempt_no)
++);
++CREATE INDEX IF NOT EXISTS idx_attempts_due ON reminder_attempts(status, due_date);
++CREATE INDEX IF NOT EXISTS idx_attempts_patient ON reminder_attempts(patient_id, placed_on);
++CREATE INDEX IF NOT EXISTS idx_attempts_sid ON reminder_attempts(twilio_call_sid);
+diff --git a/anc-reminder-system/package.json b/anc-reminder-system/package.json
+index 082da8c..900e84a 100644
+--- a/anc-reminder-system/package.json
++++ b/anc-reminder-system/package.json
+@@ -5,7 +5,8 @@
+   "main": "server.js",
+   "scripts": {
+     "start": "node server.js",
+-    "dev": "node --watch server.js"
++    "dev": "node --watch server.js",
++    "test": "node --test tests/*.test.js"
+   },
+   "dependencies": {
+     "better-sqlite3": "^11.3.0",
+diff --git a/anc-reminder-system/public/admin.css b/anc-reminder-system/public/admin.css
+index 60e03ec..b224d27 100644
+--- a/anc-reminder-system/public/admin.css
++++ b/anc-reminder-system/public/admin.css
+@@ -3,146 +3,184 @@
+   --paper: #f6f4ee;
+   --panel: #ffffff;
+   --line: #dcd7c9;
+-  --accent: #2f6f5e;   /* deep teal-green — clinical but not sterile */
++  --accent: #2f6f5e;
+   --accent-soft: #e4efe9;
+   --warn: #b6552c;
++  --warn-soft: #fbe9e1;
++  --amber: #8a6a12;
++  --amber-soft: #fbf1d3;
+   --muted: #6b6255;
+   --radius: 10px;
+ }
+-
+-* { box-sizing: border-box; }
+-
+-body {
+-  margin: 0;
+-  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+-  background: var(--paper);
+-  color: var(--ink);
++@media (prefers-color-scheme: dark) {
++  :root {
++    --ink: #e9eee9; --paper: #151b18; --panel: #1e2622; --line: #33403a;
++    --accent: #6cc4a8; --accent-soft: #23352e; --warn: #f0906a; --warn-soft: #3a2619;
++    --amber: #e3c25c; --amber-soft: #392f14; --muted: #a2aaa4;
++  }
++  .btn-primary, .tab-btn.active, .brand-mark { color: #0f1a15; }
+ }
+ 
+-.topbar {
+-  display: flex;
+-  justify-content: space-between;
+-  align-items: center;
+-  flex-wrap: wrap;
+-  gap: 16px;
+-  padding: 20px 32px;
+-  background: var(--panel);
+-  border-bottom: 1px solid var(--line);
+-}
++* { box-sizing: border-box; }
++body { margin: 0; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--paper); color: var(--ink); line-height: 1.45; }
++h2 { margin: 0 0 4px; font-size: 16px; }
++:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+ 
++.topbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; padding: 16px 32px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+ .brand { display: flex; align-items: center; gap: 14px; }
+-.brand-mark {
+-  display: inline-flex;
+-  align-items: center;
+-  justify-content: center;
+-  width: 44px; height: 44px;
+-  background: var(--accent);
+-  color: white;
+-  font-weight: 700;
+-  border-radius: 8px;
+-  letter-spacing: 0.5px;
+-  font-size: 13px;
+-}
++.brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; background: var(--accent); color: #fff; font-weight: 700; border-radius: 8px; letter-spacing: .5px; font-size: 13px; }
+ .brand h1 { font-size: 18px; margin: 0; }
+-.brand .subtitle { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+-
+-.tabs { display: flex; gap: 6px; }
+-.tab-btn {
+-  border: 1px solid var(--line);
+-  background: var(--panel);
+-  padding: 8px 16px;
+-  border-radius: 999px;
+-  cursor: pointer;
+-  font-size: 13px;
+-  color: var(--muted);
+-}
+-.tab-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
++.subtitle { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
++
++.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
++.tab-btn { border: 1px solid var(--line); background: var(--panel); padding: 8px 16px; border-radius: 999px; cursor: pointer; font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
++.tab-btn:hover { border-color: var(--accent); }
++.tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
++.count-badge { background: var(--warn); color: #fff; font-size: 11px; font-weight: 700; min-width: 18px; height: 18px; line-height: 18px; border-radius: 9px; text-align: center; padding: 0 5px; }
+ 
+-main { padding: 28px 32px; max-width: 980px; margin: 0 auto; }
++.env-banner { padding: 8px 32px; font-size: 13px; }
++.env-banner.demo { background: var(--amber-soft); color: var(--amber); }
++.env-banner.warn { background: var(--warn-soft); color: var(--warn); }
+ 
++main { padding: 24px 32px 48px; max-width: 1040px; margin: 0 auto; }
+ .tab-panel { display: none; }
+ .tab-panel.active { display: block; }
+ 
+-.card {
+-  background: var(--panel);
+-  border: 1px solid var(--line);
+-  border-radius: var(--radius);
+-  padding: 24px;
+-  margin-bottom: 20px;
+-}
+-.card h2 { margin-top: 0; font-size: 16px; }
+-
+-.form-grid {
+-  display: grid;
+-  grid-template-columns: 1fr 1fr;
+-  gap: 14px 18px;
+-}
++.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; margin-bottom: 20px; }
++.card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
++.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
++.two-col > .card { margin-bottom: 20px; }
++.hint { font-size: 12.5px; color: var(--muted); margin: 4px 0 0; }
++.hint.error { color: var(--warn); } .hint.ok { color: var(--accent); }
++.muted { color: var(--muted); } .small { font-size: 12px; } .strong { font-weight: 600; }
++.empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
++
++/* stats */
++.stat-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
++.stat { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
++.stat-n { font-size: 26px; font-weight: 700; color: var(--accent); line-height: 1.1; }
++.stat-n small { font-size: 14px; color: var(--muted); font-weight: 500; }
++.stat-l { font-size: 12px; color: var(--muted); margin-top: 4px; }
++.stat.alert { border-color: var(--warn); background: var(--warn-soft); }
++.stat.alert .stat-n { color: var(--warn); }
++
++/* lists */
++.list { list-style: none; margin: 0; padding: 0; }
++.row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
++.row:last-child { border-bottom: none; }
++
++/* forms */
++.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
++.form-grid.inner { grid-template-columns: repeat(3, 1fr); }
+ .field-wide { grid-column: 1 / -1; }
+ .checkbox-field { display: flex; align-items: center; }
+-.checkbox-field label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+-
++.checkbox-field label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink); }
+ .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+-.field input, .field select, .field textarea {
+-  width: 100%;
+-  padding: 8px 10px;
+-  border: 1px solid var(--line);
+-  border-radius: 6px;
+-  font-size: 13px;
+-  background: var(--paper);
+-  color: var(--ink);
+-}
++.field small { display: block; font-size: 11.5px; color: var(--muted); margin-top: 3px; }
++input, select, textarea { font: inherit; }
++.field input, .field select, .field textarea, .filters input, .filters select { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 14px; background: var(--paper); color: var(--ink); }
+ .field textarea { resize: vertical; }
+-
+-.form-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+-.btn-primary, .btn-secondary {
+-  border: none;
+-  padding: 10px 18px;
+-  border-radius: 6px;
+-  font-size: 13px;
+-  cursor: pointer;
+-  font-weight: 600;
+-}
+-.btn-primary { background: var(--accent); color: white; }
++fieldset.dating { border: 1px dashed var(--line); border-radius: 8px; padding: 12px 14px 8px; margin: 0; }
++fieldset.dating legend { font-size: 12px; color: var(--muted); padding: 0 6px; }
++.form-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; margin-top: 6px; }
++.filters { display: flex; gap: 8px; }
++.inline-check { font-size: 13px; display: flex; align-items: center; gap: 6px; color: var(--muted); }
++
++button { font: inherit; }
++.btn-primary, .btn-secondary { border: none; padding: 10px 18px; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 600; text-decoration: none; display: inline-block; }
++.btn-primary { background: var(--accent); color: #fff; }
+ .btn-secondary { background: var(--accent-soft); color: var(--accent); }
+-.status-msg { font-size: 12px; color: var(--muted); }
+-.status-msg.error { color: var(--warn); }
+-.status-msg.ok { color: var(--accent); }
+-
+-.data-table, .mini-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+-.data-table th, .mini-table th {
+-  text-align: left;
+-  font-size: 11px;
+-  text-transform: uppercase;
+-  letter-spacing: 0.04em;
+-  color: var(--muted);
+-  border-bottom: 1px solid var(--line);
+-  padding: 8px 6px;
++.btn-primary:hover, .btn-secondary:hover { filter: brightness(.95); }
++.btn-secondary.small { padding: 5px 12px; }
++.status-msg { font-size: 13px; color: var(--muted); }
++.status-msg.error { color: var(--warn); } .status-msg.ok { color: var(--accent); }
++
++button.link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 14px; padding: 0; text-align: left; }
++button.link-btn:hover { text-decoration: underline; }
++.chip-btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 999px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
++.chip-btn:hover { border-color: var(--accent); }
++.chip-btn.ok.on, .chip-btn.ok:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
++.chip-btn.bad.on { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
++.btn-group { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
++.icon-btn { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--muted); padding: 4px 8px; border-radius: 6px; }
++.icon-btn:hover { background: var(--accent-soft); }
++
++/* tables */
++.table-wrap { overflow-x: auto; }
++.data-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13.5px; }
++.data-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border-bottom: 1px solid var(--line); padding: 8px 8px; white-space: nowrap; }
++.data-table td { padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
++.data-table tr.inactive td { opacity: .6; }
++
++.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; margin-left: 4px; white-space: nowrap; }
++.pill:first-child { margin-left: 0; }
++.pill.intervention, .pill.ok { background: var(--accent-soft); color: var(--accent); }
++.pill.control, .pill.muted { background: var(--line); color: var(--muted); }
++.pill.alert { background: var(--warn-soft); color: var(--warn); }
++.pill.calling, .pill.upcoming { background: var(--amber-soft); color: var(--amber); }
++
++.chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0; }
++.chip { background: var(--accent-soft); color: var(--accent); font-size: 11.5px; padding: 2px 9px; border-radius: 6px; }
++
++/* protocol */
++.protocol { margin-top: 8px; }
++.proto-row { display: grid; grid-template-columns: 28px 1fr auto; gap: 12px; align-items: start; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
++.proto-row:last-child { border-bottom: none; }
++.proto-no { background: var(--accent); color: #fff; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; }
++@media (prefers-color-scheme: dark) { .proto-no { color: #0f1a15; } }
++
++/* call attempts */
++.attempts { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
++.att { display: flex; gap: 8px; align-items: flex-start; padding: 6px 12px 6px 10px; border: 1px solid var(--line); border-radius: 8px; min-width: 112px; background: var(--paper); }
++.att-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); margin-top: 5px; flex: none; }
++.att-t { font-size: 12px; font-weight: 600; } .att-s { font-size: 12px; } .att-d { font-size: 11px; color: var(--muted); }
++.att.answered .att-dot { background: var(--accent); } .att.answered .att-s { color: var(--accent); }
++.att.unanswered .att-dot, .att.failed .att-dot { background: var(--warn); } .att.unanswered .att-s, .att.failed .att-s { color: var(--warn); }
++.att.dialing .att-dot { background: var(--amber); animation: pulse 1s infinite; }
++.att.skipped, .att.cancelled { opacity: .55; }
++@keyframes pulse { 50% { opacity: .3; } }
++@media (prefers-reduced-motion: reduce) { .att.dialing .att-dot { animation: none; } }
++
++/* not responding */
++.nr-card { display: flex; justify-content: space-between; gap: 16px; padding: 16px; border: 1px solid var(--warn); border-left-width: 5px; border-radius: 8px; background: var(--warn-soft); margin-top: 12px; }
++.nr-card.done { border-color: var(--line); background: var(--paper); opacity: .8; }
++.nr-card .att { background: var(--panel); }
++.nr-main > div { margin-bottom: 4px; }
++.nr-phone a { font-size: 17px; font-weight: 700; color: var(--ink); text-decoration: none; }
++.nr-actions { display: flex; flex-direction: column; gap: 8px; align-items: stretch; min-width: 140px; }
++
++/* patient dialog */
++dialog { width: min(760px, calc(100vw - 24px)); max-height: calc(100vh - 32px); border: 1px solid var(--line); border-radius: 12px; padding: 0; background: var(--panel); color: var(--ink); }
++dialog::backdrop { background: rgba(10, 20, 15, .5); }
++.dialog-head { display: flex; justify-content: space-between; align-items: flex-start; padding: 18px 22px 10px; position: sticky; top: 0; background: var(--panel); border-bottom: 1px solid var(--line); }
++#pd-body { padding: 16px 22px 22px; }
++.pd-facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
++.pd-facts div { background: var(--paper); border-radius: 8px; padding: 8px 12px; }
++.pd-facts span { display: block; font-size: 11px; } .pd-facts strong { font-size: 14px; }
++.notice { background: var(--amber-soft); color: var(--amber); padding: 8px 12px; border-radius: 8px; font-size: 13px; }
++.timeline { display: grid; gap: 10px; }
++.visit { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
++.visit header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
++.v-no { display: inline-flex; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 12px; font-weight: 700; align-items: center; justify-content: center; margin-right: 8px; }
++@media (prefers-color-scheme: dark) { .v-no { color: #0f1a15; } }
++.visit.not_responding { border-color: var(--warn); background: var(--warn-soft); }
++.visit.attended, .visit.reached, .visit.followed_up { border-color: var(--accent); }
++.visit-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
++.dialog-foot { margin-top: 16px; text-align: right; }
++
++/* toast */
++.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--paper); padding: 10px 18px; border-radius: 8px; font-size: 13px; z-index: 50; max-width: calc(100vw - 32px); }
++.toast.error { background: var(--warn); color: #fff; }
++
++@media (max-width: 800px) {
++  .stat-row { grid-template-columns: repeat(2, 1fr); }
++  .two-col { grid-template-columns: 1fr; }
++  .pd-facts { grid-template-columns: repeat(2, 1fr); }
++  .nr-card { flex-direction: column; }
++  .proto-row { grid-template-columns: 28px 1fr; } .proto-row > .small { grid-column: 2; }
+ }
+-.data-table td, .mini-table td { padding: 8px 6px; border-bottom: 1px solid var(--line); }
+-
+-.registry-header { display: flex; justify-content: space-between; align-items: center; }
+-
+-.pill {
+-  display: inline-block;
+-  padding: 2px 9px;
+-  border-radius: 999px;
+-  font-size: 11px;
+-  font-weight: 600;
+-}
+-.pill.intervention { background: var(--accent-soft); color: var(--accent); }
+-.pill.control { background: #f0ece0; color: var(--muted); }
+-
+-button.link-btn {
+-  background: none;
+-  border: none;
+-  color: var(--accent);
+-  cursor: pointer;
+-  font-size: 12px;
+-  text-decoration: underline;
+-  padding: 0;
+-}
+-
+ @media (max-width: 640px) {
+-  .form-grid { grid-template-columns: 1fr; }
+-  main { padding: 20px 16px; }
++  .form-grid, .form-grid.inner { grid-template-columns: 1fr; }
++  main { padding: 16px 12px 40px; } .topbar { padding: 12px 16px; } .env-banner { padding: 8px 16px; }
++  .filters { width: 100%; }
+ }
+diff --git a/anc-reminder-system/public/admin.html b/anc-reminder-system/public/admin.html
+index e1e2a25..cd5a247 100644
+--- a/anc-reminder-system/public/admin.html
++++ b/anc-reminder-system/public/admin.html
+@@ -4,183 +4,169 @@
+ <meta charset="UTF-8" />
+ <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+ <title>ANC Voice Reminder — Admin</title>
++<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%232f6f5e%27/%3E%3Ctext x=%2716%27 y=%2721%27 font-size=%2711%27 font-family=%27sans-serif%27 font-weight=%27700%27 fill=%27white%27 text-anchor=%27middle%27%3EANC%3C/text%3E%3C/svg%3E" />
+ <link rel="stylesheet" href="admin.css" />
+ </head>
+ <body>
+   <header class="topbar">
+     <div class="brand">
+-      <span class="brand-mark">ANC</span>
++      <span class="brand-mark" aria-hidden="true">ANC</span>
+       <div>
+         <h1>Antenatal Voice Reminder Registry</h1>
+         <p class="subtitle">ICMR–STS 2026 · Prospective Interventional Study</p>
+       </div>
+     </div>
+-    <nav class="tabs">
+-      <button class="tab-btn active" data-tab="enroll">Enroll patient</button>
+-      <button class="tab-btn" data-tab="registry">Patient registry</button>
+-      <button class="tab-btn" data-tab="summary">Study summary</button>
++    <nav class="tabs" role="tablist" aria-label="Sections">
++      <button class="tab-btn active" role="tab" data-tab="dashboard">Today</button>
++      <button class="tab-btn" role="tab" data-tab="notresp">Not responding <span class="count-badge" id="nr-badge" hidden>0</span></button>
++      <button class="tab-btn" role="tab" data-tab="registry">Patients</button>
++      <button class="tab-btn" role="tab" data-tab="enroll">Enroll</button>
++      <button class="tab-btn" role="tab" data-tab="summary">Summary</button>
+     </nav>
+   </header>
++  <div id="env-banner" class="env-banner" hidden></div>
+ 
+   <main>
+-    <!-- ENROLL TAB -->
+-    <section id="tab-enroll" class="tab-panel active">
+-      <form id="patient-form" class="card form-grid">
+-        <h2>New patient enrollment</h2>
+-
+-        <div class="field">
+-          <label for="registration_id">Hospital registration ID *</label>
+-          <input id="registration_id" required placeholder="OBG-2026-0001" />
++    <!-- TODAY -->
++    <section id="tab-dashboard" class="tab-panel active">
++      <div class="stat-row" id="stat-row"></div>
++      <div class="two-col">
++        <div class="card">
++          <div class="card-head">
++            <h2>Calls due today</h2>
++            <button class="btn-secondary" id="sweep-btn" title="Place the calls that are due now">Run calls now</button>
++          </div>
++          <div id="due-today"></div>
+         </div>
+-        <div class="field">
+-          <label for="full_name">Full name *</label>
+-          <input id="full_name" required />
++        <div class="card">
++          <h2>Coming up (next 14 days)</h2>
++          <div id="upcoming"></div>
+         </div>
+-        <div class="field">
+-          <label for="age">Age</label>
+-          <input id="age" type="number" min="12" max="55" />
++      </div>
++      <div class="card">
++        <h2>How reminders work</h2>
++        <p class="hint">Each patient is called up to <strong>3 times</strong> per visit. If she listens, reminders for that visit stop. If all 3 calls go unanswered she appears under <strong>Not responding</strong> for staff follow-up.</p>
++        <div id="protocol" class="protocol"></div>
++      </div>
++    </section>
++
++    <!-- NOT RESPONDING -->
++    <section id="tab-notresp" class="tab-panel">
++      <div class="card">
++        <div class="card-head">
++          <div>
++            <h2>Not responding</h2>
++            <p class="hint">All 3 reminder calls went unanswered. Please contact these patients another way, then mark the follow-up done.</p>
++          </div>
++          <label class="inline-check"><input type="checkbox" id="nr-resolved" /> Show completed</label>
+         </div>
+-        <div class="field">
+-          <label for="phone_number">Phone number (with country code) *</label>
+-          <input id="phone_number" required placeholder="+91XXXXXXXXXX" />
++        <div id="nr-list"></div>
++      </div>
++    </section>
++
++    <!-- REGISTRY -->
++    <section id="tab-registry" class="tab-panel">
++      <div class="card">
++        <div class="card-head">
++          <h2>Patient registry</h2>
++          <div class="filters">
++            <input id="search" type="search" placeholder="Search name, ID or phone" aria-label="Search patients" />
++            <select id="filter-group" aria-label="Filter by group">
++              <option value="">All groups</option>
++              <option value="intervention">Intervention</option>
++              <option value="control">Control</option>
++            </select>
++          </div>
+         </div>
+-        <div class="field">
+-          <label for="language">Reminder language</label>
+-          <select id="language">
+-            <option value="or" selected>Odia</option>
+-            <option value="hi">Hindi</option>
+-            <option value="en">English</option>
+-          </select>
++        <div class="table-wrap">
++          <table class="data-table">
++            <thead><tr><th>Reg. ID</th><th>Name</th><th>Phone</th><th>Group</th><th>Gestation</th><th>Next call</th><th></th></tr></thead>
++            <tbody id="registry-body"></tbody>
++          </table>
+         </div>
+-        <div class="field">
+-          <label for="study_group">Study group *</label>
++        <p class="hint" id="registry-empty" hidden>No patients found.</p>
++      </div>
++    </section>
++
++    <!-- ENROLL -->
++    <section id="tab-enroll" class="tab-panel">
++      <form id="patient-form" class="card form-grid" novalidate>
++        <h2 class="field-wide">New patient enrollment</h2>
++
++        <div class="field"><label for="registration_id">Hospital registration ID *</label>
++          <input id="registration_id" required placeholder="OBG-2026-0001" autocomplete="off" /></div>
++        <div class="field"><label for="full_name">Full name *</label>
++          <input id="full_name" required /></div>
++        <div class="field"><label for="age">Age</label>
++          <input id="age" type="number" min="10" max="60" inputmode="numeric" /></div>
++        <div class="field"><label for="phone_number">Mobile number *</label>
++          <input id="phone_number" required placeholder="9876543210" inputmode="tel" />
++          <small>10-digit Indian number, or with country code (+91…)</small></div>
++        <div class="field"><label for="language">Reminder language</label>
++          <select id="language">
++            <option value="or" selected>Odia</option><option value="hi">Hindi</option><option value="en">English</option>
++          </select></div>
++        <div class="field"><label for="study_group">Study group *</label>
+           <select id="study_group" required>
+             <option value="intervention">Intervention (receives voice reminders)</option>
+             <option value="control">Control (routine instructions only)</option>
+-          </select>
+-        </div>
+-
+-        <div class="field">
+-          <label for="lmp_date">LMP date</label>
+-          <input id="lmp_date" type="date" />
+-        </div>
+-        <div class="field">
+-          <label for="edd_date">EDD date</label>
+-          <input id="edd_date" type="date" />
+-        </div>
+-        <div class="field">
+-          <label for="gestational_age_weeks">Gestational age at registration (weeks)</label>
+-          <input id="gestational_age_weeks" type="number" min="0" max="20" />
+-        </div>
++          </select></div>
+ 
+-        <div class="field">
+-          <label for="height_cm">Height (cm)</label>
+-          <input id="height_cm" type="number" step="0.1" />
+-        </div>
+-        <div class="field">
+-          <label for="weight_kg">Weight (kg)</label>
+-          <input id="weight_kg" type="number" step="0.1" />
+-        </div>
+-        <div class="field">
+-          <label for="occupation">Occupation</label>
+-          <input id="occupation" />
+-        </div>
++        <fieldset class="field-wide dating">
++          <legend>Pregnancy dating — enter any one *</legend>
++          <div class="form-grid inner">
++            <div class="field"><label for="lmp_date">LMP date</label><input id="lmp_date" type="date" /></div>
++            <div class="field"><label for="edd_date">EDD date</label><input id="edd_date" type="date" /></div>
++            <div class="field"><label for="gestational_age_weeks">Gestation today (weeks)</label>
++              <input id="gestational_age_weeks" type="number" min="0" max="42" step="0.5" inputmode="decimal" /></div>
++          </div>
++          <p class="hint" id="dating-preview">The visit schedule is worked out from this. LMP is used first, then EDD, then gestation.</p>
++        </fieldset>
+ 
+-        <div class="field field-wide">
+-          <label for="obstetric_history">Obstetric history</label>
+-          <textarea id="obstetric_history" rows="2"></textarea>
+-        </div>
+-        <div class="field field-wide">
+-          <label for="personal_history">Personal history</label>
+-          <textarea id="personal_history" rows="2"></textarea>
+-        </div>
++        <div class="field"><label for="height_cm">Height (cm)</label><input id="height_cm" type="number" step="0.1" /></div>
++        <div class="field"><label for="weight_kg">Weight (kg)</label><input id="weight_kg" type="number" step="0.1" /></div>
++        <div class="field"><label for="occupation">Occupation</label><input id="occupation" /></div>
++        <div class="field field-wide"><label for="obstetric_history">Obstetric history</label><textarea id="obstetric_history" rows="2"></textarea></div>
++        <div class="field field-wide"><label for="personal_history">Personal history</label><textarea id="personal_history" rows="2"></textarea></div>
+ 
+-        <div class="field checkbox-field">
+-          <label><input type="checkbox" id="consent_given" /> Written informed consent obtained *</label>
+-        </div>
+-        <div class="field checkbox-field">
+-          <label><input type="checkbox" id="high_risk" /> High-risk pregnancy (exclusion)</label>
+-        </div>
+-        <div class="field checkbox-field">
+-          <label><input type="checkbox" id="hearing_impairment" /> Hearing impairment (exclusion)</label>
+-        </div>
++        <div class="field checkbox-field"><label><input type="checkbox" id="consent_given" /> Written informed consent obtained *</label></div>
++        <div class="field checkbox-field"><label><input type="checkbox" id="high_risk" /> High-risk pregnancy (exclusion)</label></div>
++        <div class="field checkbox-field"><label><input type="checkbox" id="hearing_impairment" /> Hearing impairment (exclusion)</label></div>
+ 
+         <div class="form-actions">
+           <button type="submit" class="btn-primary">Enroll patient</button>
+-          <span id="enroll-status" class="status-msg"></span>
++          <span id="enroll-status" class="status-msg" role="status"></span>
+         </div>
+       </form>
+-
+-      <div class="card" id="visit-card" style="display:none;">
+-        <h2>Schedule visits / investigations for <span id="visit-patient-name"></span></h2>
+-        <form id="visit-form" class="form-grid">
+-          <div class="field">
+-            <label for="visit_type">Type *</label>
+-            <select id="visit_type" required>
+-              <option value="anc_visit">ANC visit</option>
+-              <option value="investigation">Investigation</option>
+-            </select>
+-          </div>
+-          <div class="field">
+-            <label for="visit_label">Label *</label>
+-            <input id="visit_label" required placeholder="e.g. ANC Visit 2 / Ultrasound (2nd trimester)" />
+-          </div>
+-          <div class="field">
+-            <label for="scheduled_date">Scheduled date *</label>
+-            <input id="scheduled_date" type="date" required />
+-          </div>
+-          <div class="form-actions">
+-            <button type="submit" class="btn-secondary">Add visit</button>
+-          </div>
+-        </form>
+-        <table class="mini-table" id="visit-table">
+-          <thead><tr><th>Type</th><th>Label</th><th>Date</th><th>Reminder due</th><th>Sent?</th><th></th></tr></thead>
+-          <tbody></tbody>
+-        </table>
+-      </div>
+     </section>
+ 
+-    <!-- REGISTRY TAB -->
+-    <section id="tab-registry" class="tab-panel">
+-      <div class="card">
+-        <div class="registry-header">
+-          <h2>Patient registry</h2>
+-          <select id="filter-group">
+-            <option value="">All groups</option>
+-            <option value="intervention">Intervention</option>
+-            <option value="control">Control</option>
+-          </select>
+-        </div>
+-        <table class="data-table">
+-          <thead>
+-            <tr>
+-              <th>Reg. ID</th><th>Name</th><th>Phone</th><th>Group</th><th>Consent</th><th>Enrolled</th><th></th>
+-            </tr>
+-          </thead>
+-          <tbody id="registry-body"></tbody>
+-        </table>
+-      </div>
+-    </section>
+-
+-    <!-- SUMMARY TAB -->
++    <!-- SUMMARY -->
+     <section id="tab-summary" class="tab-panel">
+       <div class="card">
+-        <h2>Adherence summary</h2>
+-        <table class="data-table" id="summary-table">
+-          <thead><tr><th>Group</th><th>Patients</th><th>Attended</th><th>Missed</th><th>Pending</th></tr></thead>
+-          <tbody></tbody>
+-        </table>
++        <div class="card-head"><h2>Adherence summary</h2>
++          <a class="btn-secondary as-link" href="/api/export/visits.csv">Download CSV</a></div>
++        <div class="table-wrap"><table class="data-table" id="summary-table">
++          <thead><tr><th>Group</th><th>Patients</th><th>Attended</th><th>Missed</th><th>Not recorded</th></tr></thead><tbody></tbody></table></div>
+       </div>
+-      <div class="card">
+-        <h2>Call outcomes</h2>
+-        <table class="data-table" id="call-summary-table">
+-          <thead><tr><th>Status</th><th>Count</th></tr></thead>
+-          <tbody></tbody>
+-        </table>
++      <div class="two-col">
++        <div class="card"><h2>Reminder outcome per visit</h2>
++          <div class="table-wrap"><table class="data-table" id="flow-table"><thead><tr><th>Outcome</th><th>Visits</th></tr></thead><tbody></tbody></table></div></div>
++        <div class="card"><h2>Answer rate by attempt</h2>
++          <div class="table-wrap"><table class="data-table" id="attempt-table"><thead><tr><th>Call</th><th>Placed</th><th>Answered</th></tr></thead><tbody></tbody></table></div></div>
+       </div>
+     </section>
+   </main>
+ 
++  <!-- PATIENT DETAIL -->
++  <dialog id="patient-dialog" aria-labelledby="pd-title">
++    <div class="dialog-head">
++      <div><h2 id="pd-title"></h2><p class="hint" id="pd-sub"></p></div>
++      <button class="icon-btn" id="pd-close" aria-label="Close">✕</button>
++    </div>
++    <div id="pd-body"></div>
++  </dialog>
++
++  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+   <script src="admin.js"></script>
+ </body>
+ </html>
+diff --git a/anc-reminder-system/public/admin.js b/anc-reminder-system/public/admin.js
+index 8229922..d80a23e 100644
+--- a/anc-reminder-system/public/admin.js
++++ b/anc-reminder-system/public/admin.js
+@@ -1,170 +1,315 @@
+-const $ = (sel) => document.querySelector(sel);
+-const $$ = (sel) => document.querySelectorAll(sel);
+-
+-let currentPatientId = null;
+-
+-// ---- Tabs ----
+-$$('.tab-btn').forEach(btn => {
+-  btn.addEventListener('click', () => {
+-    $$('.tab-btn').forEach(b => b.classList.remove('active'));
+-    $$('.tab-panel').forEach(p => p.classList.remove('active'));
+-    btn.classList.add('active');
+-    $(`#tab-${btn.dataset.tab}`).classList.add('active');
+-    if (btn.dataset.tab === 'registry') loadRegistry();
+-    if (btn.dataset.tab === 'summary') loadSummary();
++const $ = (s, r = document) => r.querySelector(s);
++const $$ = (s, r = document) => [...r.querySelectorAll(s)];
++const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
++
++let CONFIG = { dryRun: false, today: '' };
++let openPatientId = null;
++
++async function api(method, url, body) {
++  const res = await fetch(`/api${url}`, {
++    method,
++    headers: body ? { 'Content-Type': 'application/json' } : undefined,
++    body: body ? JSON.stringify(body) : undefined,
+   });
++  const data = await res.json().catch(() => ({}));
++  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
++  return data;
++}
++
++let toastTimer;
++function toast(msg, kind = 'ok') {
++  const t = $('#toast');
++  t.textContent = msg; t.className = `toast ${kind}`; t.hidden = false;
++  clearTimeout(toastTimer);
++  toastTimer = setTimeout(() => { t.hidden = true; }, 4500);
++}
++async function run(fn) {
++  try { return await fn(); } catch (e) { toast(e.message, 'error'); }
++}
++
++// ---- date helpers (dates are plain YYYY-MM-DD strings) -----------------------
++const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
++function fmtDate(ymd) {
++  if (!ymd) return '—';
++  const [y, m, d] = ymd.slice(0, 10).split('-').map(Number);
++  return `${d} ${MON[m - 1]} ${y}`;
++}
++const fmtWeeks = (a, b) => (a === b ? `Week ${a}` : `Weeks ${a}–${b}`);
++const ga = (p) => (p.ga_weeks === null || p.ga_weeks === undefined ? '—' : `${p.ga_weeks}w ${p.ga_days}d`);
++
++// ---- tabs ---------------------------------------------------------------------
++function showTab(name) {
++  $$('.tab-btn').forEach((b) => { const on = b.dataset.tab === name; b.classList.toggle('active', on); b.setAttribute('aria-selected', on); });
++  $$('.tab-panel').forEach((p) => p.classList.toggle('active', p.id === `tab-${name}`));
++  ({ dashboard: loadDashboard, notresp: loadNotResponding, registry: loadRegistry, summary: loadSummary }[name] || (() => {}))();
++}
++$$('.tab-btn').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
++
++// ---- Today ----------------------------------------------------------------------
++async function loadDashboard() {
++  const d = await run(() => api('GET', '/dashboard'));
++  if (!d) return;
++  setBadge(d.open_followups);
++  const stat = (n, label, cls = '') => `<div class="stat ${cls}"><div class="stat-n">${n}</div><div class="stat-l">${label}</div></div>`;
++  $('#stat-row').innerHTML =
++    stat(d.patients.intervention, 'Intervention patients') +
++    stat(d.patients.control, 'Control patients') +
++    stat(d.due_today.length, 'Calls due today') +
++    stat(`${d.calls_today.answered}<small>/${d.calls_today.placed}</small>`, 'Answered today') +
++    stat(d.open_followups, 'Need follow-up', d.open_followups ? 'alert' : '');
++
++  const dialing = d.in_progress.map((a) => `
++    <li class="row"><div><strong>${esc(a.full_name)}</strong><span class="muted"> · ${esc(a.label)}${a.manual ? ' · manual call' : `, call ${a.attempt_no}`}</span></div>
++      ${CONFIG.dryRun ? `<div class="btn-group"><button class="chip-btn ok" data-sim="answered" data-id="${a.id}">She answered</button><button class="chip-btn" data-sim="unanswered" data-id="${a.id}">No answer</button></div>` : '<span class="pill calling">Calling…</span>'}
++    </li>`).join('');
++  const due = d.due_today.map((a) => `
++    <li class="row"><div><strong>${esc(a.full_name)}</strong><span class="muted"> · ${esc(a.label)}, call ${a.attempt_no} of 3</span></div><span class="pill upcoming">Waiting</span></li>`).join('');
++  $('#due-today').innerHTML = (dialing || due) ? `<ul class="list">${dialing}${due}</ul>` : '<p class="empty">No calls due right now.</p>';
++
++  $('#upcoming').innerHTML = d.upcoming.length
++    ? `<ul class="list">${d.upcoming.map((a) => `
++      <li class="row"><div><strong>${esc(a.full_name)}</strong><span class="muted"> · ${esc(a.label)}, call ${a.attempt_no}</span></div><span class="muted">${fmtDate(a.due_date)}</span></li>`).join('')}</ul>`
++    : '<p class="empty">Nothing scheduled in the next 14 days.</p>';
++}
++
++$('#sweep-btn').addEventListener('click', () => run(async () => {
++  const r = await api('POST', '/sweep', { ignoreHours: CONFIG.dryRun });
++  toast(r.skipped ? (r.skipped === 'outside-calling-hours' ? 'Outside calling hours — calls will go out during the day.' : 'A call round is already running.') : `${r.placed} call(s) placed.`);
++  loadDashboard();
++}));
++document.addEventListener('click', (e) => {
++  const b = e.target.closest('[data-sim]');
++  if (!b) return;
++  run(async () => { await api('POST', `/attempts/${b.dataset.id}/simulate`, { outcome: b.dataset.sim }); toast('Call result recorded.'); refreshAll(); });
+ });
+ 
+-// ---- Enroll patient ----
+-$('#patient-form').addEventListener('submit', async (e) => {
+-  e.preventDefault();
+-  const statusEl = $('#enroll-status');
+-  statusEl.textContent = 'Saving...';
+-  statusEl.className = 'status-msg';
++async function loadProtocol() {
++  const p = await run(() => api('GET', '/protocol'));
++  if (!p) return;
++  $('#protocol').innerHTML = p.visits.map((v) => `
++    <div class="proto-row"><span class="proto-no">${v.no}</span>
++      <div><strong>${fmtWeeks(v.startWeek, v.endWeek)}</strong>
++        <div class="chips">${v.tests.length ? v.tests.map((t) => `<span class="chip">${esc(t)}</span>`).join('') : '<span class="muted">Check-up visit</span>'}</div></div>
++      <div class="muted small">Calls: wk ${v.startWeek}${v.startWeek + 1 <= v.endWeek ? `, wk ${v.startWeek + 1}` : ''}, final wk ${v.endWeek + 1}</div></div>`).join('');
++}
+ 
+-  const payload = {
+-    registration_id: $('#registration_id').value.trim(),
+-    full_name: $('#full_name').value.trim(),
+-    age: $('#age').value ? Number($('#age').value) : null,
+-    phone_number: $('#phone_number').value.trim(),
+-    language: $('#language').value,
+-    study_group: $('#study_group').value,
+-    lmp_date: $('#lmp_date').value || null,
+-    edd_date: $('#edd_date').value || null,
+-    gestational_age_weeks: $('#gestational_age_weeks').value ? Number($('#gestational_age_weeks').value) : null,
+-    height_cm: $('#height_cm').value ? Number($('#height_cm').value) : null,
+-    weight_kg: $('#weight_kg').value ? Number($('#weight_kg').value) : null,
+-    occupation: $('#occupation').value.trim(),
+-    obstetric_history: $('#obstetric_history').value.trim(),
+-    personal_history: $('#personal_history').value.trim(),
+-    consent_given: $('#consent_given').checked,
+-    high_risk: $('#high_risk').checked,
+-    hearing_impairment: $('#hearing_impairment').checked,
+-  };
++// ---- Not responding ---------------------------------------------------------------
++function setBadge(n) { const b = $('#nr-badge'); b.textContent = n; b.hidden = !n; }
+ 
+-  try {
+-    const res = await fetch('/api/patients', {
+-      method: 'POST',
+-      headers: { 'Content-Type': 'application/json' },
+-      body: JSON.stringify(payload),
+-    });
+-    const data = await res.json();
+-    if (!res.ok) throw new Error(data.error || 'Failed to enroll patient');
+-
+-    statusEl.textContent = `Enrolled ${data.full_name} (ID ${data.id}).`;
+-    statusEl.className = 'status-msg ok';
+-    currentPatientId = data.id;
+-    $('#visit-patient-name').textContent = data.full_name;
+-    $('#visit-card').style.display = 'block';
+-    loadVisits(data.id);
+-  } catch (err) {
+-    statusEl.textContent = err.message;
+-    statusEl.className = 'status-msg error';
++async function loadNotResponding() {
++  const rows = await run(() => api('GET', `/not-responding?resolved=${$('#nr-resolved').checked}`));
++  if (!rows) return;
++  setBadge(rows.filter((r) => !r.followup_resolved_at).length);
++  $('#nr-list').innerHTML = rows.length ? rows.map((r) => `
++    <article class="nr-card ${r.followup_resolved_at ? 'done' : ''}">
++      <div class="nr-main">
++        <div><button class="link-btn strong" data-open="${r.patient_id}">${esc(r.full_name)}</button>
++          <span class="muted"> · ${esc(r.registration_id)}</span></div>
++        <div class="nr-phone"><a href="tel:${esc(r.phone_number)}">${esc(r.phone_number)}</a></div>
++        <div><strong>${esc(r.label)}</strong> <span class="muted">(${fmtWeeks(r.window_start_week, r.window_end_week)} · now ${r.ga_weeks ?? '—'} wks)</span></div>
++        <div class="chips">${r.tests.map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</div>
++        ${attemptDots(r.attempts)}
++        <div class="muted small">${r.followup_resolved_at ? `Done: ${esc(r.followup_note || '')}` : `Flagged ${fmtDate(r.flagged_at)} · waiting ${r.days_waiting} day(s)`}</div>
++      </div>
++      <div class="nr-actions">
++        ${r.followup_resolved_at
++          ? `<button class="btn-secondary" data-reopen="${r.id}">Reopen</button>`
++          : `<button class="btn-primary" data-resolve="${r.id}">Follow-up done</button>
++             <button class="btn-secondary" data-callnow="${r.id}">Call again</button>`}
++      </div>
++    </article>`).join('') : '<p class="empty">Nobody is waiting for follow-up. 🎉</p>';
++}
++$('#nr-resolved').addEventListener('change', loadNotResponding);
++
++function attemptDots(attempts) {
++  const planned = attempts.filter((a) => !a.manual);
++  const manual = attempts.filter((a) => a.manual);
++  const lbl = { answered: 'Answered', unanswered: 'No answer', dialing: 'Calling', scheduled: 'Scheduled', skipped: 'Skipped', cancelled: 'Not needed', failed: 'Failed' };
++  const one = (a, i) => `<div class="att ${a.status}"><span class="att-dot"></span><div><div class="att-t">${a.manual ? 'Extra call' : `Call ${i + 1}`}</div>
++    <div class="att-s">${lbl[a.status] || a.status}</div><div class="att-d">${fmtDate(a.due_date)}</div></div></div>`;
++  return `<div class="attempts">${planned.map(one).join('')}${manual.map(one).join('')}</div>`;
++}
++
++document.addEventListener('click', (e) => {
++  const t = e.target.closest('button');
++  if (!t) return;
++  if (t.dataset.open) openPatient(Number(t.dataset.open));
++  if (t.dataset.resolve) {
++    const note = prompt('Short note (e.g. "Phoned husband, will visit Monday"):', '');
++    if (note === null) return;
++    run(async () => { await api('POST', `/visits/${t.dataset.resolve}/resolve`, { note }); toast('Follow-up marked done.'); refreshAll(); });
++  }
++  if (t.dataset.reopen) run(async () => { await api('POST', `/visits/${t.dataset.reopen}/reopen`); refreshAll(); });
++  if (t.dataset.callnow) {
++    if (!confirm('Place an extra reminder call to this patient now?')) return;
++    run(async () => { await api('POST', `/visits/${t.dataset.callnow}/call-now`); toast('Call placed.'); refreshAll(); });
++  }
++  if (t.dataset.attend !== undefined) {
++    const val = t.dataset.attend === 'null' ? null : t.dataset.attend === 'true';
++    run(async () => { await api('PATCH', `/visits/${t.dataset.visit}`, { attended: val }); refreshAll(); });
+   }
+ });
+ 
+-// ---- Schedule visits ----
+-$('#visit-form').addEventListener('submit', async (e) => {
++// ---- Registry ---------------------------------------------------------------------------
++let searchTimer;
++$('#search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadRegistry, 250); });
++$('#filter-group').addEventListener('change', loadRegistry);
++
++async function loadRegistry() {
++  const q = new URLSearchParams();
++  if ($('#filter-group').value) q.set('study_group', $('#filter-group').value);
++  if ($('#search').value.trim()) q.set('q', $('#search').value.trim());
++  const rows = await run(() => api('GET', `/patients?${q}`));
++  if (!rows) return;
++  $('#registry-empty').hidden = rows.length > 0;
++  $('#registry-body').innerHTML = rows.map((p) => `
++    <tr class="${p.active ? '' : 'inactive'}">
++      <td>${esc(p.registration_id)}</td>
++      <td><button class="link-btn strong" data-open="${p.id}">${esc(p.full_name)}</button>
++        ${p.open_followups ? `<span class="pill alert">Follow-up</span>` : ''}${p.active ? '' : '<span class="pill muted">Closed</span>'}</td>
++      <td>${esc(p.phone_number)}</td>
++      <td><span class="pill ${p.study_group}">${p.study_group}</span></td>
++      <td>${ga(p)}</td>
++      <td>${p.study_group === 'control' ? '<span class="muted">—</span>' : fmtDate(p.next_call_date)}</td>
++      <td><button class="btn-secondary small" data-open="${p.id}">Open</button></td>
++    </tr>`).join('');
++}
++
++// ---- Patient dialog ---------------------------------------------------------------------
++const STATUS = {
++  attended: ['Attended', 'ok'], missed: ['Missed', 'alert'], not_responding: ['Not responding', 'alert'],
++  followed_up: ['Follow-up done', 'ok'], reached: ['Reminder heard', 'ok'], calling: ['Calling', 'calling'],
++  upcoming: ['Upcoming', 'upcoming'], skipped: ['Handled at enrolment', 'muted'], due_now: ['Due now', 'calling'], overdue: ['Past window', 'muted'],
++};
++
++async function openPatient(id) {
++  openPatientId = id;
++  const p = await run(() => api('GET', `/patients/${id}`));
++  if (!p) return;
++  renderPatient(p);
++  const dlg = $('#patient-dialog');
++  if (!dlg.open) dlg.showModal();
++}
++
++function renderPatient(p) {
++  $('#pd-title').textContent = p.full_name;
++  $('#pd-sub').textContent = `${p.registration_id} · ${p.phone_number} · ${p.study_group}`;
++  const src = { lmp: 'LMP', edd: 'EDD', ga: 'gestation at registration' }[p.dating_source] || '';
++  const callable = p.study_group === 'intervention' && p.consent_given && p.active && !p.high_risk && !p.hearing_impairment;
++  $('#pd-body').innerHTML = `
++    <div class="pd-facts">
++      <div><span class="muted">Gestation today</span><strong>${ga(p)}</strong></div>
++      <div><span class="muted">Dated from</span><strong>${esc(src)}</strong></div>
++      <div><span class="muted">Expected delivery</span><strong>${fmtDate(p.expected_delivery)}</strong></div>
++      <div><span class="muted">Reminder calls</span><strong>${callable ? 'On' : 'Off'}</strong></div>
++    </div>
++    ${!callable && p.study_group === 'intervention' ? `<p class="notice">Calls are off: ${[!p.consent_given && 'no consent', !p.active && 'case closed', p.high_risk && 'high-risk exclusion', p.hearing_impairment && 'hearing impairment'].filter(Boolean).join(', ')}.</p>` : ''}
++    <div class="timeline">${p.visits.map(visitCard).join('')}</div>
++    <div class="dialog-foot">
++      <button class="btn-secondary" id="pd-toggle">${p.active ? 'Close case (delivered / withdrawn)' : 'Reopen case'}</button>
++    </div>`;
++  $('#pd-toggle').onclick = () => {
++    if (p.active && !confirm('Close this case? No more reminder calls will be made.')) return;
++    run(async () => { await api('PATCH', `/patients/${p.id}`, { active: !p.active }); refreshAll(); });
++  };
++}
++
++function visitCard(v) {
++  const [label, cls] = STATUS[v.status] || [v.status, 'muted'];
++  const inProgress = v.attempts.find((a) => a.status === 'dialing');
++  const canCall = !['not_applicable', 'legacy'].includes(v.reminder_state) && v.attended !== 1 && !inProgress;
++  return `
++    <section class="visit ${v.status}">
++      <header><div><span class="v-no">${v.visit_no ?? '•'}</span><strong>${esc(v.label)}</strong>
++        <span class="muted"> · ${fmtWeeks(v.window_start_week, v.window_end_week)} · ${fmtDate(v.window_start_date)} – ${fmtDate(v.window_end_date)}</span></div>
++        <span class="pill ${cls}">${label}</span></header>
++      <div class="chips">${v.tests.length ? v.tests.map((t) => `<span class="chip">${esc(t)}</span>`).join('') : '<span class="muted small">Routine check-up</span>'}</div>
++      ${v.attempts.length ? attemptDots(v.attempts) : ''}
++      ${inProgress && CONFIG.dryRun ? `<div class="btn-group"><span class="muted small">Dry run:</span><button class="chip-btn ok" data-sim="answered" data-id="${inProgress.id}">She answered</button><button class="chip-btn" data-sim="unanswered" data-id="${inProgress.id}">No answer</button></div>` : ''}
++      <div class="visit-actions">
++        <span class="muted small">Attendance:</span>
++        <button class="chip-btn ${v.attended === 1 ? 'ok on' : ''}" data-visit="${v.id}" data-attend="${v.attended === 1 ? 'null' : 'true'}">Attended</button>
++        <button class="chip-btn ${v.attended === 0 ? 'bad on' : ''}" data-visit="${v.id}" data-attend="${v.attended === 0 ? 'null' : 'false'}">Missed</button>
++        ${canCall ? `<button class="chip-btn" data-callnow="${v.id}">Call now</button>` : ''}
++      </div>
++    </section>`;
++}
++$('#pd-close').addEventListener('click', () => $('#patient-dialog').close());
++$('#patient-dialog').addEventListener('click', (e) => { if (e.target.id === 'patient-dialog') e.target.close(); });
++$('#patient-dialog').addEventListener('close', () => { openPatientId = null; });
++
++// ---- Enroll -------------------------------------------------------------------------------
++function updateDatingPreview() {
++  const lmp = $('#lmp_date').value; const edd = $('#edd_date').value; const g = $('#gestational_age_weeks').value;
++  const el = $('#dating-preview');
++  const t = new Date(`${CONFIG.today || new Date().toISOString().slice(0, 10)}T00:00:00Z`);
++  let ref = null; let src = '';
++  if (lmp) { ref = new Date(`${lmp}T00:00:00Z`); src = 'LMP'; }
++  else if (edd) { ref = new Date(new Date(`${edd}T00:00:00Z`).getTime() - 280 * 864e5); src = 'EDD'; }
++  else if (g !== '') { ref = new Date(t.getTime() - Number(g) * 7 * 864e5); src = 'gestation'; }
++  if (!ref) { el.textContent = 'The visit schedule is worked out from this. LMP is used first, then EDD, then gestation.'; el.className = 'hint'; return; }
++  const days = Math.round((t - ref) / 864e5);
++  const bad = days < 0 || days > 294;
++  el.textContent = bad ? `That gives ${Math.floor(days / 7)} weeks — please check the date.` : `Using ${src}: she is ${Math.floor(days / 7)} weeks ${days % 7} days pregnant today.`;
++  el.className = bad ? 'hint error' : 'hint ok';
++}
++['lmp_date', 'edd_date', 'gestational_age_weeks'].forEach((id) => $(`#${id}`).addEventListener('input', updateDatingPreview));
++
++$('#patient-form').addEventListener('submit', async (e) => {
+   e.preventDefault();
+-  if (!currentPatientId) return;
++  const st = $('#enroll-status');
++  const v = (id) => $(`#${id}`).value.trim();
++  const n = (id) => (v(id) === '' ? null : Number(v(id)));
+   const payload = {
+-    visit_type: $('#visit_type').value,
+-    label: $('#visit_label').value.trim(),
+-    scheduled_date: $('#scheduled_date').value,
++    registration_id: v('registration_id'), full_name: v('full_name'), age: n('age'), phone_number: v('phone_number'),
++    language: v('language'), study_group: v('study_group'),
++    lmp_date: v('lmp_date') || null, edd_date: v('edd_date') || null, gestational_age_weeks: n('gestational_age_weeks'),
++    height_cm: n('height_cm'), weight_kg: n('weight_kg'), occupation: v('occupation'),
++    obstetric_history: v('obstetric_history'), personal_history: v('personal_history'),
++    consent_given: $('#consent_given').checked, high_risk: $('#high_risk').checked, hearing_impairment: $('#hearing_impairment').checked,
+   };
+-  const res = await fetch(`/api/patients/${currentPatientId}/visits`, {
+-    method: 'POST',
+-    headers: { 'Content-Type': 'application/json' },
+-    body: JSON.stringify(payload),
+-  });
+-  if (res.ok) {
+-    $('#visit-form').reset();
+-    loadVisits(currentPatientId);
+-  } else {
+-    const data = await res.json();
+-    alert(data.error || 'Failed to add visit');
+-  }
++  const missing = [['registration_id', 'Registration ID'], ['full_name', 'Name'], ['phone_number', 'Mobile number']].find(([k]) => !payload[k]);
++  if (missing) { st.textContent = `${missing[1]} is required.`; st.className = 'status-msg error'; return; }
++  st.textContent = 'Saving…'; st.className = 'status-msg';
++  try {
++    const p = await api('POST', '/patients', payload);
++    st.textContent = `Enrolled ${p.full_name}.`; st.className = 'status-msg ok';
++    e.target.reset(); updateDatingPreview();
++    toast(`Enrolled ${p.full_name} — visit schedule created.`);
++    openPatient(p.id);
++  } catch (err) { st.textContent = err.message; st.className = 'status-msg error'; }
+ });
+ 
+-async function loadVisits(patientId) {
+-  const res = await fetch(`/api/patients/${patientId}`);
+-  const patient = await res.json();
+-  const tbody = $('#visit-table tbody');
+-  tbody.innerHTML = '';
+-  patient.visits.forEach(v => {
+-    const tr = document.createElement('tr');
+-    tr.innerHTML = `
+-      <td>${v.visit_type === 'anc_visit' ? 'ANC visit' : 'Investigation'}</td>
+-      <td>${v.label}</td>
+-      <td>${v.scheduled_date}</td>
+-      <td>${v.reminder_scheduled_for ? new Date(v.reminder_scheduled_for).toLocaleString() : '—'}</td>
+-      <td>${v.reminder_sent ? 'Yes' : 'No'}</td>
+-      <td>${v.reminder_scheduled_for ? `<button class="link-btn" data-visit="${v.id}">Trigger now (test)</button>` : ''}</td>
+-    `;
+-    tbody.appendChild(tr);
+-  });
+-  tbody.querySelectorAll('button[data-visit]').forEach(btn => {
+-    btn.addEventListener('click', async () => {
+-      btn.textContent = 'Calling...';
+-      const r = await fetch(`/api/visits/${btn.dataset.visit}/trigger-call`, { method: 'POST' });
+-      const d = await r.json();
+-      btn.textContent = r.ok ? `Sent (${d.status})` : `Error: ${d.error}`;
+-    });
+-  });
++// ---- Summary -------------------------------------------------------------------------------
++async function loadSummary() {
++  const d = await run(() => api('GET', '/summary'));
++  if (!d) return;
++  $('#summary-table tbody').innerHTML = d.byGroup.map((r) => `<tr><td><span class="pill ${r.study_group}">${r.study_group}</span></td><td>${r.patients}</td><td>${r.attended || 0}</td><td>${r.missed || 0}</td><td>${r.pending || 0}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No data yet.</td></tr>';
++  const names = { reached: 'Heard the reminder', not_responding: 'Not responding', pending: 'Still in progress', closed: 'Attended before call' };
++  $('#flow-table tbody').innerHTML = d.flow.map((r) => `<tr><td>${names[r.state] || r.state}</td><td>${r.count}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">No calls yet.</td></tr>';
++  $('#attempt-table tbody').innerHTML = d.byAttempt.map((r) => `<tr><td>Call ${r.attempt_no}</td><td>${r.placed}</td><td>${r.answered || 0}${r.placed ? ` <span class="muted">(${Math.round(100 * (r.answered || 0) / r.placed)}%)</span>` : ''}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">No calls yet.</td></tr>';
+ }
+ 
+-// ---- Registry ----
+-async function loadRegistry() {
+-  const group = $('#filter-group').value;
+-  const res = await fetch(`/api/patients${group ? `?study_group=${group}` : ''}`);
+-  const patients = await res.json();
+-  const tbody = $('#registry-body');
+-  tbody.innerHTML = '';
+-  patients.forEach(p => {
+-    const tr = document.createElement('tr');
+-    tr.innerHTML = `
+-      <td>${p.registration_id}</td>
+-      <td>${p.full_name}</td>
+-      <td>${p.phone_number}</td>
+-      <td><span class="pill ${p.study_group}">${p.study_group}</span></td>
+-      <td>${p.consent_given ? '✓' : '—'}</td>
+-      <td>${new Date(p.enrolled_at).toLocaleDateString()}</td>
+-      <td><button class="link-btn" data-open="${p.id}">Open</button></td>
+-    `;
+-    tbody.appendChild(tr);
+-  });
+-  tbody.querySelectorAll('button[data-open]').forEach(btn => {
+-    btn.addEventListener('click', () => {
+-      currentPatientId = Number(btn.dataset.open);
+-      $$('.tab-btn').forEach(b => b.classList.remove('active'));
+-      $$('.tab-panel').forEach(p => p.classList.remove('active'));
+-      $('.tab-btn[data-tab="enroll"]').classList.add('active');
+-      $('#tab-enroll').classList.add('active');
+-      $('#visit-card').style.display = 'block';
+-      const p = patients.find(x => x.id === currentPatientId);
+-      $('#visit-patient-name').textContent = p ? p.full_name : '';
+-      loadVisits(currentPatientId);
+-    });
+-  });
++// ---- boot -----------------------------------------------------------------------------------------
++function refreshAll() {
++  const active = $('.tab-btn.active').dataset.tab;
++  showTab(active);
++  if (openPatientId) openPatient(openPatientId);
++  else loadBadge();
+ }
+-$('#filter-group').addEventListener('change', loadRegistry);
+-
+-// ---- Summary ----
+-async function loadSummary() {
+-  const res = await fetch('/api/summary');
+-  const data = await res.json();
+-  const body = $('#summary-table tbody');
+-  body.innerHTML = '';
+-  data.byGroup.forEach(row => {
+-    const tr = document.createElement('tr');
+-    tr.innerHTML = `<td>${row.study_group}</td><td>${row.patients}</td><td>${row.attended || 0}</td><td>${row.missed || 0}</td><td>${row.pending || 0}</td>`;
+-    body.appendChild(tr);
+-  });
+-  const callBody = $('#call-summary-table tbody');
+-  callBody.innerHTML = '';
+-  data.callStats.forEach(row => {
+-    const tr = document.createElement('tr');
+-    tr.innerHTML = `<td>${row.status}</td><td>${row.count}</td>`;
+-    callBody.appendChild(tr);
+-  });
++async function loadBadge() {
++  const r = await api('GET', '/not-responding').catch(() => null);
++  if (r) setBadge(r.length);
+ }
++
++(async function init() {
++  try { CONFIG = await api('GET', '/config'); } catch { /* banner stays hidden */ }
++  const b = $('#env-banner');
++  if (CONFIG.dryRun) { b.hidden = false; b.className = 'env-banner demo'; b.textContent = 'Demo mode (DRY_RUN): no real calls are placed. Use the “She answered / No answer” buttons to test the flow.'; }
++  else if (CONFIG.twilioConfigured === false) { b.hidden = false; b.className = 'env-banner warn'; b.textContent = 'Twilio is not configured yet — reminder calls cannot be placed. See README step 4.'; }
++  updateDatingPreview();
++  loadProtocol();
++  loadDashboard();
++  loadBadge();
++  setInterval(() => { if (document.visibilityState === 'visible' && $('#tab-dashboard').classList.contains('active')) loadDashboard(); }, 30000);
++})();
+diff --git a/anc-reminder-system/routes/calls.js b/anc-reminder-system/routes/calls.js
+index 0057d80..46b986a 100644
+--- a/anc-reminder-system/routes/calls.js
++++ b/anc-reminder-system/routes/calls.js
+@@ -1,83 +1,95 @@
+ const express = require('express');
+-const router = express.Router();
+-const db = require('../db');
++const fs = require('fs');
++const path = require('path');
+ const twilio = require('twilio');
++const db = require('../db');
++const reminders = require('../services/reminders');
++const telephony = require('../services/telephony');
+ 
+-const {
+-  TWILIO_ACCOUNT_SID,
+-  TWILIO_AUTH_TOKEN,
+-  TWILIO_FROM_NUMBER,
+-  PUBLIC_BASE_URL, // e.g. https://your-domain.com — must be publicly reachable by Twilio
+-} = process.env;
++const router = express.Router();
++const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
++const AUDIO_DIR = path.join(__dirname, '..', 'audio');
+ 
+-const client = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)
+-  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+-  : null;
++// Twilio webhooks must really come from Twilio.
++function requireTwilio(req, res, next) {
++  if (!telephony.validateWebhook(req)) return res.status(403).type('text/plain').send('Invalid signature');
++  next();
++}
++
++// ---- 1. TwiML: what Twilio plays when the patient picks up -------------------
++// One recording for everyone. If audio/reminder_<lang>.mp3 exists it is used for
++// patients with that language (e.g. reminder_or.mp3); otherwise audio/reminder.mp3.
++router.all('/voice/reminder', requireTwilio, (req, res) => {
++  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
++  const attemptId = Number(req.query.attempt) || null;
++  let lang = null;
++  if (attemptId) {
++    const row = db.prepare(`
++      SELECT p.language FROM reminder_attempts a JOIN patients p ON p.id = a.patient_id WHERE a.id = ?
++    `).get(attemptId);
++    lang = row && /^[a-z]{2,3}$/.test(row.language || '') ? row.language : null;
++  }
++  const file = [lang && `reminder_${lang}.mp3`, 'reminder.mp3']
++    .filter(Boolean).find((f) => fs.existsSync(path.join(AUDIO_DIR, f)));
+ 
+-// ---- 1. TwiML: what Twilio plays when the call connects ----
+-// Same recording for every patient, as requested. Drop your file at
+-// public/audio/reminder.mp3 (or reminder_or.mp3 for Odia) and it's served statically.
+-router.get('/voice/reminder', (req, res) => {
+   const twiml = new twilio.twiml.VoiceResponse();
+-  const audioUrl = `${PUBLIC_BASE_URL}/audio/reminder.mp3`;
+-  twiml.play(audioUrl);
+-  // Optional: repeat once in case the line was noisy at pickup
+-  twiml.pause({ length: 1 });
+-  twiml.play(audioUrl);
+-  res.type('text/xml');
+-  res.send(twiml.toString());
++  if (file) {
++    const url = `${base}/audio/${file}`;
++    twiml.play(url);
++    twiml.pause({ length: 1 });
++    twiml.play(url); // repeated once in case the line was noisy at pickup
++  } else {
++    console.error('[voice] audio/reminder.mp3 is missing — playing a spoken fallback.');
++    twiml.say('This is a reminder from the hospital for your antenatal check-up. Please visit the hospital for your tests. Thank you.');
++  }
++  res.type('text/xml').send(twiml.toString());
+ });
+ 
+-// ---- 2. Twilio status callback: call progress updates land here ----
+-router.post('/voice/status', (req, res) => {
+-  const { CallSid, CallStatus } = req.body;
+-  db.prepare(`
+-    UPDATE call_logs SET status = ?, updated_at = CURRENT_TIMESTAMP
+-    WHERE twilio_call_sid = ?
+-  `).run(CallStatus, CallSid);
++// ---- 2. Twilio status callback: call progress -> attempt result ---------------
++router.post('/voice/status', requireTwilio, (req, res) => {
++  const { CallSid, CallStatus, CallDuration } = req.body || {};
++  let attemptId = Number(req.query.attempt) || null;
++  if (!attemptId && CallSid) {
++    const a = db.prepare('SELECT id FROM reminder_attempts WHERE twilio_call_sid = ?').get(CallSid);
++    attemptId = a ? a.id : null;
++  }
++  if (attemptId && CallStatus) {
++    try {
++      reminders.applyCallStatus(attemptId, {
++        status: CallStatus,
++        duration: CallDuration !== undefined && CallDuration !== '' ? Number(CallDuration) : null,
++        sid: CallSid || null,
++      });
++    } catch (err) {
++      console.error(`[voice] status update failed for attempt ${attemptId}: ${err.message}`);
++    }
++  }
+   res.sendStatus(204);
+ });
+ 
+-// ---- 3. Trigger a single reminder call for a given visit ----
+-// Called by the scheduler automatically, or manually for testing.
+-async function triggerCallForVisit(visitId) {
+-  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
+-  if (!visit) throw new Error('Visit not found');
+-  const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(visit.patient_id);
+-  if (!patient) throw new Error('Patient not found');
+-
+-  if (!client) {
+-    throw new Error('Twilio is not configured. Set TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER in .env');
+-  }
+-
+-  const attemptNumber = db.prepare('SELECT COUNT(*) AS c FROM call_logs WHERE visit_id = ?').get(visitId).c + 1;
+-
+-  const call = await client.calls.create({
+-    to: patient.phone_number,
+-    from: TWILIO_FROM_NUMBER,
+-    url: `${PUBLIC_BASE_URL}/api/voice/reminder`,
+-    statusCallback: `${PUBLIC_BASE_URL}/api/voice/status`,
+-    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
+-  });
++// ---- 3. Staff actions ---------------------------------------------------------
+ 
+-  db.prepare(`
+-    INSERT INTO call_logs (visit_id, patient_id, twilio_call_sid, status, attempt_number)
+-    VALUES (?, ?, ?, ?, ?)
+-  `).run(visitId, patient.id, call.sid, call.status, attemptNumber);
++// "Call now": an extra, manual call for one visit.
++router.post('/visits/:id/call-now', wrap(async (req, res) => {
++  res.json(await reminders.manualCall(Number(req.params.id)));
++}));
+ 
+-  db.prepare('UPDATE visits SET reminder_sent = 1 WHERE id = ?').run(visitId);
++// Dry-run only: finish a pretend call so the whole flow can be demonstrated without Twilio.
++router.post('/attempts/:id/simulate', wrap(async (req, res) => {
++  if (!telephony.isDryRun()) throw reminders.httpError(400, 'Simulation is only available when DRY_RUN=true.');
++  const outcome = (req.body || {}).outcome;
++  if (!['answered', 'unanswered'].includes(outcome)) throw reminders.httpError(400, "outcome must be 'answered' or 'unanswered'.");
++  const ok = reminders.applyCallStatus(Number(req.params.id), outcome === 'answered'
++    ? { status: 'completed', duration: 45 }
++    : { status: 'no-answer', duration: 0 });
++  if (!ok) throw reminders.httpError(409, 'That call is not in progress.');
++  res.json({ ok: true });
++}));
+ 
+-  return call;
+-}
+-
+-// Manual/test trigger endpoint — lets the admin fire a reminder call on demand
+-router.post('/visits/:id/trigger-call', async (req, res) => {
+-  try {
+-    const call = await triggerCallForVisit(req.params.id);
+-    res.json({ ok: true, callSid: call.sid, status: call.status });
+-  } catch (err) {
+-    res.status(400).json({ error: err.message });
+-  }
+-});
++// Run the scheduler pass now (dry-run demos can also ignore calling hours).
++router.post('/sweep', wrap(async (req, res) => {
++  const ignoreHours = telephony.isDryRun() && (req.body || {}).ignoreHours === true;
++  res.json(await reminders.runSweep({ ignoreHours }));
++}));
+ 
+-module.exports = { router, triggerCallForVisit };
++module.exports = { router };
+diff --git a/anc-reminder-system/routes/patients.js b/anc-reminder-system/routes/patients.js
+index b91c0cc..5931aaa 100644
+--- a/anc-reminder-system/routes/patients.js
++++ b/anc-reminder-system/routes/patients.js
+@@ -1,6 +1,12 @@
+ const express = require('express');
+ const router = express.Router();
+ const db = require('../db');
++const dates = require('../lib/dates');
++const { resolveDating, normalizePhone } = require('../lib/dating');
++const reminders = require('../services/reminders');
++
++// Wraps a handler so thrown errors (incl. httpError) reach the error middleware.
++const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+ 
+ function computeBmi(heightCm, weightKg) {
+   if (!heightCm || !weightKg) return null;
+@@ -8,165 +14,213 @@ function computeBmi(heightCm, weightKg) {
+   return +(weightKg / (h * h)).toFixed(1);
+ }
+ 
+-function minus48h(dateStr) {
+-  // dateStr: 'YYYY-MM-DD' -> ISO datetime 48h earlier, at 09:00 local time of that day
+-  const d = new Date(`${dateStr}T09:00:00`);
+-  d.setHours(d.getHours() - 48);
+-  return d.toISOString();
++const bool = (v) => (v === true || v === 1 || v === '1' || v === 'true' ? 1 : 0);
++const numOrNull = (v) => (v === undefined || v === null || v === '' || Number.isNaN(Number(v)) ? null : Number(v));
++const textOrNull = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());
++
++function patientView(p, todayStr = dates.today()) {
++  const ga = p.reference_lmp ? dates.gestationalAge(p.reference_lmp, todayStr) : null;
++  return {
++    ...p,
++    ga_weeks: ga ? ga.weeks : null,
++    ga_days: ga ? ga.days : null,
++    expected_delivery: p.reference_lmp ? dates.addDays(p.reference_lmp, 280) : null,
++  };
++}
++
++function loadVisits(patientId, todayStr) {
++  const visits = db.prepare(`
++    SELECT * FROM visits WHERE patient_id = ?
++    ORDER BY visit_no IS NULL, visit_no, scheduled_date
++  `).all(patientId);
++  const attempts = db.prepare('SELECT * FROM reminder_attempts WHERE patient_id = ? ORDER BY visit_id, attempt_no').all(patientId);
++  return visits.map((v) => reminders.decorateVisit(v, attempts.filter((a) => a.visit_id === v.id), todayStr));
+ }
+ 
+-// ---- Patients ----
++// ---- Patients ----------------------------------------------------------------
+ 
+-// Create patient
+ router.post('/patients', (req, res) => {
+-  const b = req.body;
+-  const required = ['registration_id', 'full_name', 'phone_number', 'study_group', 'consent_given'];
+-  for (const f of required) {
+-    if (b[f] === undefined || b[f] === null || b[f] === '') {
++  const b = req.body || {};
++  for (const f of ['registration_id', 'full_name', 'phone_number', 'study_group']) {
++    if (b[f] === undefined || b[f] === null || String(b[f]).trim() === '') {
+       return res.status(400).json({ error: `Missing required field: ${f}` });
+     }
+   }
+-  if (!/^\+\d{10,15}$/.test(b.phone_number)) {
+-    return res.status(400).json({ error: 'phone_number must be in E.164 format, e.g. +91XXXXXXXXXX' });
+-  }
++  const phone = normalizePhone(b.phone_number);
++  if (!phone) return res.status(400).json({ error: 'Enter a valid mobile number, e.g. 9876543210 or +919876543210.' });
+   if (!['intervention', 'control'].includes(b.study_group)) {
+     return res.status(400).json({ error: "study_group must be 'intervention' or 'control'" });
+   }
++  if (b.age !== undefined && b.age !== null && b.age !== '' && !(Number(b.age) >= 10 && Number(b.age) <= 60)) {
++    return res.status(400).json({ error: 'Age looks wrong (expected 10–60).' });
++  }
++  if (b.study_group === 'intervention' && !bool(b.consent_given)) {
++    return res.status(400).json({ error: 'Written informed consent is required before a patient can receive reminder calls.' });
++  }
+ 
+-  const bmi = computeBmi(b.height_cm, b.weight_kg);
++  const now = new Date();
++  const todayStr = dates.today(now);
++  let dating;
++  try {
++    dating = resolveDating(b, todayStr);
++  } catch (e) {
++    return res.status(e.status || 400).json({ error: e.message });
++  }
+ 
+   try {
+-    const stmt = db.prepare(`
++    const info = db.prepare(`
+       INSERT INTO patients (
+         registration_id, full_name, age, phone_number, language,
+-        lmp_date, edd_date, gestational_age_weeks,
++        lmp_date, edd_date, gestational_age_weeks, reference_lmp, dating_source,
+         height_cm, weight_kg, bmi, occupation, obstetric_history, personal_history,
+-        study_group, consent_given, high_risk, hearing_impairment
++        study_group, consent_given, high_risk, hearing_impairment, enrolled_at
+       ) VALUES (@registration_id, @full_name, @age, @phone_number, @language,
+-        @lmp_date, @edd_date, @gestational_age_weeks,
++        @lmp_date, @edd_date, @gestational_age_weeks, @reference_lmp, @dating_source,
+         @height_cm, @weight_kg, @bmi, @occupation, @obstetric_history, @personal_history,
+-        @study_group, @consent_given, @high_risk, @hearing_impairment)
+-    `);
+-    const info = stmt.run({
+-      registration_id: b.registration_id,
+-      full_name: b.full_name,
+-      age: b.age ?? null,
+-      phone_number: b.phone_number,
++        @study_group, @consent_given, @high_risk, @hearing_impairment, @enrolled_at)
++    `).run({
++      registration_id: String(b.registration_id).trim(),
++      full_name: String(b.full_name).trim(),
++      age: numOrNull(b.age),
++      phone_number: phone,
+       language: b.language || 'or',
+-      lmp_date: b.lmp_date ?? null,
+-      edd_date: b.edd_date ?? null,
+-      gestational_age_weeks: b.gestational_age_weeks ?? null,
+-      height_cm: b.height_cm ?? null,
+-      weight_kg: b.weight_kg ?? null,
+-      bmi,
+-      occupation: b.occupation ?? null,
+-      obstetric_history: b.obstetric_history ?? null,
+-      personal_history: b.personal_history ?? null,
++      lmp_date: textOrNull(b.lmp_date),
++      edd_date: textOrNull(b.edd_date),
++      gestational_age_weeks: numOrNull(b.gestational_age_weeks),
++      reference_lmp: dating.reference_lmp,
++      dating_source: dating.dating_source,
++      height_cm: numOrNull(b.height_cm),
++      weight_kg: numOrNull(b.weight_kg),
++      bmi: computeBmi(numOrNull(b.height_cm), numOrNull(b.weight_kg)),
++      occupation: textOrNull(b.occupation),
++      obstetric_history: textOrNull(b.obstetric_history),
++      personal_history: textOrNull(b.personal_history),
+       study_group: b.study_group,
+-      consent_given: b.consent_given ? 1 : 0,
+-      high_risk: b.high_risk ? 1 : 0,
+-      hearing_impairment: b.hearing_impairment ? 1 : 0,
++      consent_given: bool(b.consent_given),
++      high_risk: bool(b.high_risk),
++      hearing_impairment: bool(b.hearing_impairment),
++      enrolled_at: now.toISOString(),
+     });
+     const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(info.lastInsertRowid);
+-    res.status(201).json(patient);
++    reminders.generateVisits(patient, dating.reference_lmp, now);
++    res.status(201).json({ ...patientView(patient, todayStr), visits: loadVisits(patient.id, todayStr) });
+   } catch (err) {
+     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+-      return res.status(409).json({ error: 'A patient with this registration_id already exists' });
++      return res.status(409).json({ error: 'A patient with this registration ID already exists.' });
+     }
+     res.status(500).json({ error: err.message });
+   }
+ });
+ 
+-// List patients (with optional group filter)
++// List patients (filters: study_group, active, q = name / reg. id / phone)
+ router.get('/patients', (req, res) => {
+-  const { study_group, active } = req.query;
+-  let query = 'SELECT * FROM patients WHERE 1=1';
++  const { study_group, active, q } = req.query;
++  const where = ['1=1'];
+   const params = [];
+-  if (study_group) { query += ' AND study_group = ?'; params.push(study_group); }
+-  if (active !== undefined) { query += ' AND active = ?'; params.push(active === 'true' ? 1 : 0); }
+-  query += ' ORDER BY enrolled_at DESC';
+-  res.json(db.prepare(query).all(...params));
++  if (study_group) { where.push('p.study_group = ?'); params.push(study_group); }
++  if (active !== undefined && active !== '') { where.push('p.active = ?'); params.push(active === 'true' ? 1 : 0); }
++  if (q) {
++    where.push('(p.full_name LIKE ? OR p.registration_id LIKE ? OR p.phone_number LIKE ?)');
++    const like = `%${String(q).trim()}%`;
++    params.push(like, like, like);
++  }
++  const rows = db.prepare(`
++    SELECT p.*,
++      (SELECT COUNT(*) FROM visits v WHERE v.patient_id = p.id AND v.reminder_state = 'not_responding'
++         AND v.followup_resolved_at IS NULL) AS open_followups,
++      (SELECT MIN(a.due_date) FROM reminder_attempts a
++         JOIN visits v ON v.id = a.visit_id
++        WHERE a.patient_id = p.id AND a.status = 'scheduled' AND a.manual = 0
++          AND v.reminder_state = 'pending') AS next_call_date
++    FROM patients p WHERE ${where.join(' AND ')}
++    ORDER BY p.enrolled_at DESC
++  `).all(...params);
++  const todayStr = dates.today();
++  res.json(rows.map((r) => patientView(r, todayStr)));
+ });
+ 
+-// Get one patient with visits + call logs
++// One patient with the full 7-visit timeline
+ router.get('/patients/:id', (req, res) => {
+   const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id);
+   if (!patient) return res.status(404).json({ error: 'Patient not found' });
+-  const visits = db.prepare('SELECT * FROM visits WHERE patient_id = ? ORDER BY scheduled_date').all(req.params.id);
+-  const visitIds = visits.map(v => v.id);
+-  const logs = visitIds.length
+-    ? db.prepare(`SELECT * FROM call_logs WHERE visit_id IN (${visitIds.map(() => '?').join(',')}) ORDER BY triggered_at`).all(...visitIds)
+-    : [];
+-  res.json({ ...patient, visits, call_logs: logs });
++  const todayStr = dates.today();
++  res.json({ ...patientView(patient, todayStr), visits: loadVisits(patient.id, todayStr) });
+ });
+ 
+-// Update patient (e.g. mark withdrawn, correct a field)
++// Update a patient. Changing dating or eligibility rebuilds the not-yet-started visits.
+ router.patch('/patients/:id', (req, res) => {
+   const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id);
+   if (!patient) return res.status(404).json({ error: 'Patient not found' });
+-  const allowed = ['full_name', 'phone_number', 'language', 'active', 'consent_given', 'weight_kg', 'height_cm'];
++  const b = req.body || {};
+   const updates = {};
+-  for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
+-  if (updates.height_cm || updates.weight_kg) {
+-    updates.bmi = computeBmi(updates.height_cm ?? patient.height_cm, updates.weight_kg ?? patient.weight_kg);
++
++  if (b.full_name !== undefined) {
++    if (!String(b.full_name).trim()) return res.status(400).json({ error: 'Name cannot be empty.' });
++    updates.full_name = String(b.full_name).trim();
+   }
+-  const setClause = Object.keys(updates).map(k => `${k} = @${k}`).join(', ');
+-  if (setClause) {
+-    db.prepare(`UPDATE patients SET ${setClause} WHERE id = @id`).run({ ...updates, id: req.params.id });
++  if (b.phone_number !== undefined) {
++    const phone = normalizePhone(b.phone_number);
++    if (!phone) return res.status(400).json({ error: 'Enter a valid mobile number.' });
++    updates.phone_number = phone;
++  }
++  if (b.language !== undefined) updates.language = b.language;
++  for (const k of ['active', 'consent_given', 'high_risk', 'hearing_impairment']) {
++    if (b[k] !== undefined) updates[k] = bool(b[k]);
++  }
++  for (const k of ['height_cm', 'weight_kg']) if (b[k] !== undefined) updates[k] = numOrNull(b[k]);
++  if (updates.height_cm !== undefined || updates.weight_kg !== undefined) {
++    updates.bmi = computeBmi(updates.height_cm ?? patient.height_cm, updates.weight_kg ?? patient.weight_kg);
+   }
+-  res.json(db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id));
+-});
+ 
+-// ---- Visits ----
++  let redate = false;
++  if (['lmp_date', 'edd_date', 'gestational_age_weeks'].some((k) => b[k] !== undefined)) {
++    const merged = {
++      lmp_date: b.lmp_date !== undefined ? textOrNull(b.lmp_date) : patient.lmp_date,
++      edd_date: b.edd_date !== undefined ? textOrNull(b.edd_date) : patient.edd_date,
++      gestational_age_weeks: b.gestational_age_weeks !== undefined ? numOrNull(b.gestational_age_weeks) : patient.gestational_age_weeks,
++    };
++    try {
++      const enrolDay = dates.today(new Date(patient.enrolled_at));
++      Object.assign(updates, merged, resolveDating(merged, enrolDay));
++      redate = true;
++    } catch (e) {
++      return res.status(e.status || 400).json({ error: e.message });
++    }
++  }
+ 
+-// Add a scheduled ANC visit or investigation for a patient
+-router.post('/patients/:id/visits', (req, res) => {
+-  const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(req.params.id);
+-  if (!patient) return res.status(404).json({ error: 'Patient not found' });
++  const eligibilityChanged = ['active', 'consent_given', 'high_risk', 'hearing_impairment']
++    .some((k) => updates[k] !== undefined && updates[k] !== patient[k]);
+ 
+-  const { visit_type, label, scheduled_date } = req.body;
+-  if (!visit_type || !label || !scheduled_date) {
+-    return res.status(400).json({ error: 'visit_type, label and scheduled_date are required' });
+-  }
+-  if (!['anc_visit', 'investigation'].includes(visit_type)) {
+-    return res.status(400).json({ error: "visit_type must be 'anc_visit' or 'investigation'" });
++  const cols = Object.keys(updates);
++  if (cols.length) {
++    db.prepare(`UPDATE patients SET ${cols.map((k) => `${k} = @${k}`).join(', ')} WHERE id = @id`)
++      .run({ ...updates, id: patient.id });
+   }
++  const fresh = db.prepare('SELECT * FROM patients WHERE id = ?').get(patient.id);
++  if ((redate || eligibilityChanged) && fresh.reference_lmp) reminders.generateVisits(fresh, fresh.reference_lmp);
+ 
+-  const reminderAt = patient.study_group === 'intervention' ? minus48h(scheduled_date) : null;
++  const todayStr = dates.today();
++  res.json({ ...patientView(fresh, todayStr), visits: loadVisits(fresh.id, todayStr) });
++});
+ 
+-  const info = db.prepare(`
+-    INSERT INTO visits (patient_id, visit_type, label, scheduled_date, reminder_scheduled_for)
+-    VALUES (?, ?, ?, ?, ?)
+-  `).run(req.params.id, visit_type, label, scheduled_date, reminderAt);
++// ---- Visits ------------------------------------------------------------------
+ 
+-  res.status(201).json(db.prepare('SELECT * FROM visits WHERE id = ?').get(info.lastInsertRowid));
+-});
++// Attendance: true = attended, false = missed, null = not recorded yet
++router.patch('/visits/:id', wrap(async (req, res) => {
++  const { attended } = req.body || {};
++  if (![true, false, null].includes(attended)) {
++    return res.status(400).json({ error: 'attended must be true, false or null.' });
++  }
++  res.json(reminders.markAttendance(Number(req.params.id), attended));
++}));
+ 
+-// Mark a visit's attendance outcome (used for study analysis)
+-router.patch('/visits/:id', (req, res) => {
+-  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id);
+-  if (!visit) return res.status(404).json({ error: 'Visit not found' });
+-  const { attended } = req.body;
+-  db.prepare('UPDATE visits SET attended = ? WHERE id = ?').run(attended ? 1 : 0, req.params.id);
+-  res.json(db.prepare('SELECT * FROM visits WHERE id = ?').get(req.params.id));
+-});
++// Staff closes a "Not responding" follow-up (called / visited the patient)
++router.post('/visits/:id/resolve', wrap(async (req, res) => {
++  res.json(reminders.resolveFollowup(Number(req.params.id), (req.body || {}).note));
++}));
+ 
+-// Dashboard summary — quick adherence counts for the study
+-router.get('/summary', (req, res) => {
+-  const byGroup = db.prepare(`
+-    SELECT p.study_group,
+-           COUNT(DISTINCT p.id) AS patients,
+-           SUM(CASE WHEN v.attended = 1 THEN 1 ELSE 0 END) AS attended,
+-           SUM(CASE WHEN v.attended = 0 THEN 1 ELSE 0 END) AS missed,
+-           SUM(CASE WHEN v.attended IS NULL THEN 1 ELSE 0 END) AS pending
+-    FROM patients p
+-    LEFT JOIN visits v ON v.patient_id = p.id
+-    GROUP BY p.study_group
+-  `).all();
+-  const callStats = db.prepare(`
+-    SELECT status, COUNT(*) AS count FROM call_logs GROUP BY status
+-  `).all();
+-  res.json({ byGroup, callStats });
+-});
++router.post('/visits/:id/reopen', wrap(async (req, res) => {
++  res.json(reminders.reopenFollowup(Number(req.params.id)));
++}));
+ 
+ module.exports = router;
+diff --git a/anc-reminder-system/routes/reports.js b/anc-reminder-system/routes/reports.js
+new file mode 100644
+index 0000000..dbfa98c
+--- /dev/null
++++ b/anc-reminder-system/routes/reports.js
+@@ -0,0 +1,143 @@
++const express = require('express');
++const db = require('../db');
++const dates = require('../lib/dates');
++const reminders = require('../services/reminders');
++const telephony = require('../services/telephony');
++const { VISITS, MAX_ATTEMPTS } = require('../config/schedule');
++
++const router = express.Router();
++
++router.get('/config', (req, res) => {
++  const hours = (k, d) => (process.env[k] !== undefined && process.env[k] !== '' ? Number(process.env[k]) : d);
++  res.json({
++    dryRun: telephony.isDryRun(),
++    twilioConfigured: telephony.isConfigured(),
++    timezone: dates.TIMEZONE,
++    today: dates.today(),
++    callWindow: { startHour: hours('CALL_WINDOW_START_HOUR', 9), endHour: hours('CALL_WINDOW_END_HOUR', 18) },
++  });
++});
++
++// The protocol, as shown to staff.
++router.get('/protocol', (req, res) => {
++  res.json({ maxAttempts: MAX_ATTEMPTS, visits: VISITS });
++});
++
++router.get('/dashboard', (req, res) => {
++  const today = dates.today();
++  const one = (sql, ...p) => db.prepare(sql).get(...p);
++
++  const patients = one(`SELECT COUNT(*) AS total,
++      SUM(study_group = 'intervention') AS intervention, SUM(study_group = 'control') AS control
++    FROM patients WHERE active = 1`);
++  const openFollowups = one(`SELECT COUNT(*) AS c FROM visits
++    WHERE reminder_state = 'not_responding' AND followup_resolved_at IS NULL`).c;
++  const dueToday = reminders.findDueAttempts(today);
++  const placedToday = one(`SELECT COUNT(*) AS placed,
++      SUM(status = 'answered') AS answered, SUM(status = 'dialing') AS in_progress
++    FROM reminder_attempts WHERE placed_on = ?`, today);
++  const flow = one(`SELECT SUM(reminder_state = 'reached') AS reached,
++      SUM(reminder_state = 'not_responding') AS not_responding,
++      SUM(reminder_state = 'pending') AS pending
++    FROM visits WHERE visit_no IS NOT NULL`);
++
++  const upcoming = db.prepare(`
++    SELECT a.id, a.due_date, a.attempt_no, v.id AS visit_id, v.label, p.id AS patient_id, p.full_name
++    FROM reminder_attempts a
++    JOIN visits v ON v.id = a.visit_id JOIN patients p ON p.id = a.patient_id
++    WHERE a.status = 'scheduled' AND a.manual = 0 AND v.reminder_state = 'pending'
++      AND a.due_date > ? AND a.due_date <= ? AND p.active = 1
++    ORDER BY a.due_date, p.full_name LIMIT 30
++  `).all(today, dates.addDays(today, 14));
++
++  res.json({
++    today,
++    patients: { total: patients.total || 0, intervention: patients.intervention || 0, control: patients.control || 0 },
++    open_followups: openFollowups,
++    due_today: dueToday.map((d) => ({ attempt_id: d.id, attempt_no: d.attempt_no, label: d.label, full_name: d.full_name, due_date: d.due_date })),
++    calls_today: { placed: placedToday.placed || 0, answered: placedToday.answered || 0, in_progress: placedToday.in_progress || 0 },
++    flow: { reached: flow.reached || 0, not_responding: flow.not_responding || 0, pending: flow.pending || 0 },
++    in_progress: db.prepare(`
++      SELECT a.id, a.attempt_no, a.manual, v.label, p.full_name FROM reminder_attempts a
++      JOIN visits v ON v.id = a.visit_id JOIN patients p ON p.id = a.patient_id
++      WHERE a.status = 'dialing' ORDER BY a.placed_at`).all(),
++    upcoming,
++  });
++});
++
++// The "Not responding" block: every visit whose 3 calls all went unanswered.
++router.get('/not-responding', (req, res) => {
++  const includeResolved = req.query.resolved === 'true';
++  const rows = db.prepare(`
++    SELECT v.*, p.full_name, p.registration_id, p.phone_number, p.language, p.reference_lmp
++    FROM visits v JOIN patients p ON p.id = v.patient_id
++    WHERE v.reminder_state = 'not_responding' ${includeResolved ? '' : 'AND v.followup_resolved_at IS NULL'}
++    ORDER BY v.followup_resolved_at IS NOT NULL, v.flagged_at
++  `).all();
++  const today = dates.today();
++  const attemptsFor = db.prepare('SELECT * FROM reminder_attempts WHERE visit_id = ? ORDER BY attempt_no');
++  res.json(rows.map((r) => ({
++    ...reminders.decorateVisit(r, attemptsFor.all(r.id), today),
++    full_name: r.full_name, registration_id: r.registration_id, phone_number: r.phone_number,
++    patient_id: r.patient_id,
++    ga_weeks: r.reference_lmp ? dates.gestationalAge(r.reference_lmp, today).weeks : null,
++    days_waiting: r.flagged_at ? Math.max(0, dates.diffDays(dates.today(new Date(r.flagged_at)), today)) : 0,
++  })));
++});
++
++// Study summary: adherence by group + how the reminder flow turned out.
++router.get('/summary', (req, res) => {
++  const byGroup = db.prepare(`
++    SELECT p.study_group,
++           COUNT(DISTINCT p.id) AS patients,
++           SUM(CASE WHEN v.attended = 1 THEN 1 ELSE 0 END) AS attended,
++           SUM(CASE WHEN v.attended = 0 THEN 1 ELSE 0 END) AS missed,
++           SUM(CASE WHEN v.attended IS NULL AND v.id IS NOT NULL THEN 1 ELSE 0 END) AS pending
++    FROM patients p LEFT JOIN visits v ON v.patient_id = p.id
++    GROUP BY p.study_group
++  `).all();
++  const callStats = db.prepare(`
++    SELECT status, COUNT(*) AS count FROM reminder_attempts
++    WHERE status IN ('answered','unanswered','dialing','failed') GROUP BY status
++  `).all();
++  const flow = db.prepare(`
++    SELECT reminder_state AS state, COUNT(*) AS count FROM visits
++    WHERE visit_no IS NOT NULL AND reminder_state IN ('pending','reached','not_responding','closed')
++    GROUP BY reminder_state
++  `).all();
++  const byAttempt = db.prepare(`
++    SELECT attempt_no, COUNT(*) AS placed, SUM(status = 'answered') AS answered
++    FROM reminder_attempts WHERE manual = 0 AND status IN ('answered','unanswered') GROUP BY attempt_no ORDER BY attempt_no
++  `).all();
++  res.json({ byGroup, callStats, flow, byAttempt });
++});
++
++// CSV for analysis (Excel opens it directly).
++router.get('/export/visits.csv', (req, res) => {
++  const rows = db.prepare(`
++    SELECT p.registration_id, p.full_name, p.study_group, p.reference_lmp, v.label, v.window_start_date, v.window_end_date,
++           v.reminder_state, v.attended, v.flagged_at, v.followup_resolved_at, v.followup_note, v.id AS visit_id
++    FROM visits v JOIN patients p ON p.id = v.patient_id
++    WHERE v.visit_no IS NOT NULL ORDER BY p.registration_id, v.visit_no
++  `).all();
++  const att = db.prepare('SELECT attempt_no, status, due_date, placed_at FROM reminder_attempts WHERE visit_id = ? AND manual = 0 ORDER BY attempt_no');
++  const safe = (v) => {
++    if (v === null || v === undefined) return '';
++    let s = String(v);
++    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`; // stop spreadsheet formula injection
++    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
++  };
++  const head = ['registration_id', 'name', 'group', 'lmp', 'visit', 'window_start', 'window_end', 'reminder_state', 'attended',
++    'call1_due', 'call1_result', 'call2_due', 'call2_result', 'call3_due', 'call3_result', 'flagged_not_responding_at', 'followup_resolved_at', 'followup_note'];
++  const lines = [head.join(',')];
++  for (const r of rows) {
++    const a = att.all(r.visit_id);
++    const cell = (n) => { const x = a.find((y) => y.attempt_no === n); return x ? [x.due_date, x.status] : ['', '']; };
++    lines.push([r.registration_id, r.full_name, r.study_group, r.reference_lmp, r.label, r.window_start_date, r.window_end_date,
++      r.reminder_state, r.attended === null ? '' : r.attended ? 'yes' : 'no', ...cell(1), ...cell(2), ...cell(3),
++      r.flagged_at, r.followup_resolved_at, r.followup_note].map(safe).join(','));
++  }
++  res.type('text/csv').set('Content-Disposition', 'attachment; filename="anc-visits.csv"').send('﻿' + lines.join('\n'));
++});
++
++module.exports = { router };
+diff --git a/anc-reminder-system/scheduler.js b/anc-reminder-system/scheduler.js
+index 556ae49..9782653 100644
+--- a/anc-reminder-system/scheduler.js
++++ b/anc-reminder-system/scheduler.js
+@@ -1,43 +1,24 @@
+ const cron = require('node-cron');
+-const db = require('./db');
+-const { triggerCallForVisit } = require('./routes/calls');
++const { runSweep } = require('./services/reminders');
+ 
+-// Runs every 30 minutes. Finds intervention-group visits whose 48h-before
+-// reminder time has arrived, the patient is still active & consented,
+-// and no call has been sent yet — then places the call.
+-function findDueVisits() {
+-  const nowIso = new Date().toISOString();
+-  return db.prepare(`
+-    SELECT v.id AS visit_id, v.label, p.full_name, p.phone_number
+-    FROM visits v
+-    JOIN patients p ON p.id = v.patient_id
+-    WHERE v.reminder_sent = 0
+-      AND v.reminder_scheduled_for IS NOT NULL
+-      AND v.reminder_scheduled_for <= ?
+-      AND p.study_group = 'intervention'
+-      AND p.consent_given = 1
+-      AND p.active = 1
+-  `).all(nowIso);
+-}
+-
+-async function runReminderSweep() {
+-  const due = findDueVisits();
+-  if (due.length === 0) return;
+-  console.log(`[scheduler] ${due.length} reminder call(s) due — dispatching...`);
+-  for (const v of due) {
+-    try {
+-      await triggerCallForVisit(v.visit_id);
+-      console.log(`[scheduler] Called ${v.full_name} (${v.phone_number}) for "${v.label}"`);
+-    } catch (err) {
+-      console.error(`[scheduler] Failed for visit ${v.visit_id}: ${err.message}`);
+-    }
++// Every 10 minutes the sweep places whichever planned calls are due today.
++// It only dials during calling hours (default 9:00–18:00 hospital time) and never
++// calls the same patient twice in one day, so running it often is safe.
++async function tick() {
++  try {
++    const r = await runSweep();
++    if (r && r.due) console.log(`[scheduler] due=${r.due} placed=${r.placed} failed=${r.failed}`);
++  } catch (err) {
++    console.error(`[scheduler] sweep failed: ${err.message}`);
+   }
+ }
+ 
++let task = null;
+ function start() {
+-  // Every 30 minutes. Adjust the cron expression if you want finer granularity.
+-  cron.schedule('*/30 * * * *', runReminderSweep);
+-  console.log('[scheduler] Reminder sweep scheduled every 30 minutes.');
++  task = cron.schedule('*/10 * * * *', tick);
++  setTimeout(tick, 5000); // also catch up shortly after a restart
++  console.log('[scheduler] Reminder sweep runs every 10 minutes.');
+ }
++function stop() { if (task) task.stop(); }
+ 
+-module.exports = { start, runReminderSweep, findDueVisits };
++module.exports = { start, stop, tick };
+diff --git a/anc-reminder-system/server.js b/anc-reminder-system/server.js
+index de77f51..b198bd9 100644
+--- a/anc-reminder-system/server.js
++++ b/anc-reminder-system/server.js
+@@ -1,29 +1,69 @@
+ require('dotenv').config();
++const crypto = require('crypto');
+ const express = require('express');
+ const path = require('path');
+ 
++const db = require('./db');
+ const patientsRouter = require('./routes/patients');
+ const { router: callsRouter } = require('./routes/calls');
++const { router: reportsRouter } = require('./routes/reports');
+ const scheduler = require('./scheduler');
+ 
+ const app = express();
+-app.use(express.json());
++app.disable('x-powered-by');
++app.use(express.json({ limit: '100kb' }));
+ app.use(express.urlencoded({ extended: false })); // Twilio posts as form-encoded
+ 
+-// Static admin UI
++app.get('/health', (req, res) => {
++  try { db.prepare('SELECT 1').get(); res.json({ ok: true }); } catch { res.status(500).json({ ok: false }); }
++});
++
++// Optional password gate for the admin panel + API (set ADMIN_PASSWORD in .env).
++// Twilio's webhooks and the audio file stay open — Twilio can't log in.
++const { ADMIN_USER = 'admin', ADMIN_PASSWORD } = process.env;
++const safeEq = (a, b) => {
++  const ha = crypto.createHash('sha256').update(String(a)).digest();
++  const hb = crypto.createHash('sha256').update(String(b)).digest();
++  return crypto.timingSafeEqual(ha, hb);
++};
++app.use((req, res, next) => {
++  if (!ADMIN_PASSWORD || req.path.startsWith('/api/voice/') || req.path.startsWith('/audio/') || req.path === '/health') return next();
++  const [scheme, token] = (req.get('authorization') || '').split(' ');
++  if (scheme === 'Basic' && token) {
++    const [u, ...rest] = Buffer.from(token, 'base64').toString().split(':');
++    if (safeEq(u, ADMIN_USER) && safeEq(rest.join(':'), ADMIN_PASSWORD)) return next();
++  }
++  res.set('WWW-Authenticate', 'Basic realm="ANC Reminder Admin"').status(401).send('Login required');
++});
++
++app.get('/', (req, res) => res.redirect('/admin.html'));
+ app.use(express.static(path.join(__dirname, 'public')));
+-// Static audio files (the single recorded reminder message)
+ app.use('/audio', express.static(path.join(__dirname, 'audio')));
+ 
+-// API routes
+ app.use('/api', patientsRouter);
+ app.use('/api', callsRouter);
++app.use('/api', reportsRouter);
+ 
+-app.get('/health', (req, res) => res.json({ ok: true }));
++app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
++// eslint-disable-next-line no-unused-vars
++app.use((err, req, res, next) => {
++  const status = err.status || 500;
++  if (status >= 500) console.error(err);
++  res.status(status).json({ error: status >= 500 ? 'Something went wrong on the server.' : err.message });
++});
+ 
+ const PORT = process.env.PORT || 3000;
+-app.listen(PORT, () => {
+-  console.log(`ANC reminder system running on http://localhost:${PORT}`);
+-  console.log(`Admin panel: http://localhost:${PORT}/admin.html`);
+-  scheduler.start();
+-});
++if (require.main === module) {
++  const server = app.listen(PORT, () => {
++    console.log(`ANC reminder system running on http://localhost:${PORT}`);
++    console.log(`Admin panel: http://localhost:${PORT}/admin.html`);
++    if (!ADMIN_PASSWORD) console.warn('[security] ADMIN_PASSWORD is not set — the admin panel and patient data are open to anyone who can reach this server.');
++    if (process.env.DRY_RUN === 'true') console.warn('[telephony] DRY_RUN=true — no real calls will be placed.');
++    scheduler.start();
++  });
++  const shutdown = () => { scheduler.stop(); server.close(() => { db.close(); process.exit(0); }); };
++  process.on('SIGINT', shutdown);
++  process.on('SIGTERM', shutdown);
++}
++
++module.exports = app;
+diff --git a/anc-reminder-system/services/reminders.js b/anc-reminder-system/services/reminders.js
+new file mode 100644
+index 0000000..e040f77
+--- /dev/null
++++ b/anc-reminder-system/services/reminders.js
+@@ -0,0 +1,367 @@
++// ---------------------------------------------------------------------------
++// Reminder engine — the hospital call flow, in one file.
++//
++//   enrol patient ──► 7 protocol visits, each with 3 planned call attempts
++//
++//   attempt due ──► call placed ──► patient listens ──► visit = REACHED (stop)
++//                                └─► no answer / busy / hung up
++//                                      └─► next attempt (or, after attempt 3,
++//                                          visit = NOT_RESPONDING → staff list)
++//
++// Visit reminder_state:  pending | reached | not_responding | closed |
++//                        skipped | not_applicable | legacy
++// Attempt status:        scheduled | dialing | answered | unanswered |
++//                        skipped | cancelled | failed
++// ---------------------------------------------------------------------------
++const db = require('../db');
++const dates = require('../lib/dates');
++const { buildPlan } = require('../config/schedule');
++const telephony = require('./telephony');
++
++const num = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
++const CALL_START_HOUR = () => num(process.env.CALL_WINDOW_START_HOUR, 9);
++const CALL_END_HOUR = () => num(process.env.CALL_WINDOW_END_HOUR, 18);
++const MIN_ANSWER_SECONDS = () => num(process.env.MIN_ANSWER_SECONDS, 10);
++const MAX_API_ERRORS = 3;
++const STALE_AFTER_MIN = 15;     // ask Twilio what happened to a call with no result
++const NO_SID_AFTER_MIN = 5;     // claimed but Twilio was never reached (crash)
++const GIVE_UP_AFTER_MIN = 60;   // still unknown after an hour -> count as unanswered
++
++const TERMINAL = new Set(['completed', 'busy', 'no-answer', 'failed', 'canceled']);
++
++const iso = (now) => now.toISOString();
++
++// ---- eligibility ----------------------------------------------------------
++
++function isCallable(p) {
++  return p.study_group === 'intervention' && p.consent_given === 1 && p.active === 1
++    && p.high_risk === 0 && p.hearing_impairment === 0;
++}
++
++// ---- schedule generation --------------------------------------------------
++
++function isLocked(visit) {
++  if (visit.attended !== null) return true;
++  const used = db.prepare(`
++    SELECT COUNT(*) AS c FROM reminder_attempts
++    WHERE visit_id = ? AND status IN ('dialing','answered','unanswered','failed')
++  `).get(visit.id).c;
++  return used > 0;
++}
++
++// Creates the 7 protocol visits (+ call attempts for intervention patients).
++// Safe to call again after an LMP correction: visits that already have call
++// history or an attendance record are kept, the rest are rebuilt.
++// Attempts whose date has already passed, and every attempt of a window that was
++// already open on the enrolment day, are marked 'skipped' (e.g. a patient who
++// enrols at 15 weeks never gets calls for the 6-9 week window).
++function generateVisits(patient, lmp, now = new Date()) {
++  const todayStr = dates.today(now);
++  // The patient is physically at the hospital on her enrolment day, so any visit
++  // window that had already opened by then is handled in person, not by phone.
++  const enrolDay = patient.enrolled_at ? dates.today(new Date(patient.enrolled_at)) : todayStr;
++  const callable = isCallable(patient);
++  const existing = db.prepare('SELECT * FROM visits WHERE patient_id = ? AND visit_no IS NOT NULL').all(patient.id);
++
++  const insVisit = db.prepare(`
++    INSERT INTO visits (patient_id, visit_type, label, scheduled_date, visit_no,
++      window_start_week, window_end_week, window_start_date, window_end_date, tests, reminder_state)
++    VALUES (@patient_id, 'anc_visit', @label, @window_start_date, @visit_no,
++      @window_start_week, @window_end_week, @window_start_date, @window_end_date, @tests, @state)
++  `);
++  const insAttempt = db.prepare(`
++    INSERT INTO reminder_attempts (visit_id, patient_id, attempt_no, due_date, status)
++    VALUES (?, ?, ?, ?, ?)
++  `);
++
++  db.transaction(() => {
++    for (const p of buildPlan(lmp)) {
++      const ex = existing.find((v) => v.visit_no === p.visit_no);
++      if (ex) {
++        if (isLocked(ex)) continue;
++        db.prepare('DELETE FROM visits WHERE id = ?').run(ex.id);
++      }
++      const inPerson = p.window_start_date <= enrolDay;
++      const live = !inPerson && p.attempts.some((a) => a.due_date >= todayStr);
++      const state = !callable ? 'not_applicable' : live ? 'pending' : 'skipped';
++      const info = insVisit.run({
++        patient_id: patient.id,
++        label: p.label,
++        visit_no: p.visit_no,
++        window_start_week: p.window_start_week,
++        window_end_week: p.window_end_week,
++        window_start_date: p.window_start_date,
++        window_end_date: p.window_end_date,
++        tests: JSON.stringify(p.tests),
++        state,
++      });
++      if (callable) {
++        for (const a of p.attempts) {
++          insAttempt.run(info.lastInsertRowid, patient.id, a.attempt_no, a.due_date,
++            inPerson || a.due_date < todayStr ? 'skipped' : 'scheduled');
++        }
++      }
++    }
++  })();
++}
++
++// ---- attempt lifecycle ----------------------------------------------------
++
++// Records the result of an attempt and moves the visit through the flow.
++// Only acts on attempts still 'dialing', so duplicate/late webhooks are harmless.
++const finalizeAttempt = db.transaction((attemptId, outcome, info, now) => {
++  const a = db.prepare('SELECT * FROM reminder_attempts WHERE id = ?').get(attemptId);
++  if (!a || a.status !== 'dialing') return false;
++
++  db.prepare(`
++    UPDATE reminder_attempts
++    SET status = @outcome, call_status = COALESCE(@call_status, call_status),
++        duration_sec = COALESCE(@duration, duration_sec), completed_at = @ts,
++        last_error = COALESCE(@error, last_error)
++    WHERE id = @id
++  `).run({
++    outcome, id: attemptId, ts: iso(now),
++    call_status: info.status ?? null, duration: info.duration ?? null, error: info.error ?? null,
++  });
++
++  const v = db.prepare('SELECT * FROM visits WHERE id = ?').get(a.visit_id);
++
++  if (outcome === 'answered') {
++    if (['pending', 'not_responding', 'skipped'].includes(v.reminder_state)) {
++      db.prepare(`UPDATE reminder_attempts SET status = 'cancelled' WHERE visit_id = ? AND status = 'scheduled'`).run(v.id);
++      db.prepare(`
++        UPDATE visits SET reminder_state = 'reached',
++          followup_resolved_at = CASE WHEN reminder_state = 'not_responding' AND followup_resolved_at IS NULL THEN @ts ELSE followup_resolved_at END,
++          followup_note = CASE WHEN reminder_state = 'not_responding' AND followup_resolved_at IS NULL THEN 'Reached by a later call' ELSE followup_note END
++        WHERE id = @id
++      `).run({ id: v.id, ts: iso(now) });
++    }
++  } else if (v.reminder_state === 'pending') {
++    const remaining = db.prepare(`
++      SELECT COUNT(*) AS c FROM reminder_attempts WHERE visit_id = ? AND status IN ('scheduled','dialing')
++    `).get(v.id).c;
++    if (remaining === 0) {
++      db.prepare(`UPDATE visits SET reminder_state = 'not_responding', flagged_at = ? WHERE id = ?`).run(iso(now), v.id);
++    }
++  }
++  return true;
++});
++
++// Twilio status update (webhook or reconciliation) -> attempt state.
++function applyCallStatus(attemptId, { status, duration = null, sid = null }, now = new Date()) {
++  const a = db.prepare('SELECT * FROM reminder_attempts WHERE id = ?').get(attemptId);
++  if (!a || a.status !== 'dialing') return false;
++  if (sid && !a.twilio_call_sid) {
++    db.prepare('UPDATE reminder_attempts SET twilio_call_sid = ? WHERE id = ?').run(sid, attemptId);
++  }
++  if (!TERMINAL.has(status)) {
++    db.prepare('UPDATE reminder_attempts SET call_status = ? WHERE id = ?').run(status, attemptId);
++    return true;
++  }
++  const listened = status === 'completed' && (duration ?? 0) >= MIN_ANSWER_SECONDS();
++  return finalizeAttempt(attemptId, listened ? 'answered' : 'unanswered', { status, duration }, now);
++}
++
++// ---- placing calls --------------------------------------------------------
++
++// Atomically reserves a planned attempt. Fails (returns false) if it was already
++// taken, an earlier attempt for the visit is unresolved, or this patient has
++// already been called today — that last rule keeps attempts a day apart and
++// stops two visits' reminders from landing on the same day.
++function claimAttempt(id, todayStr, now) {
++  const r = db.prepare(`
++    UPDATE reminder_attempts
++    SET status = 'dialing', placed_at = @ts, placed_on = @today
++    WHERE id = @id AND status = 'scheduled'
++      AND NOT EXISTS (SELECT 1 FROM reminder_attempts o
++                      WHERE o.patient_id = reminder_attempts.patient_id AND o.placed_on = @today)
++      AND NOT EXISTS (SELECT 1 FROM reminder_attempts o
++                      WHERE o.visit_id = reminder_attempts.visit_id
++                        AND (o.status = 'dialing'
++                             OR (o.status = 'scheduled' AND o.attempt_no < reminder_attempts.attempt_no)))
++  `).run({ id, today: todayStr, ts: iso(now) });
++  return r.changes === 1;
++}
++
++async function placeAttempt(attemptId, now = new Date()) {
++  const todayStr = dates.today(now);
++  if (!claimAttempt(attemptId, todayStr, now)) return 'not-claimed';
++
++  const a = db.prepare('SELECT * FROM reminder_attempts WHERE id = ?').get(attemptId);
++  const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(a.patient_id);
++  try {
++    const call = await telephony.placeCall({ to: patient.phone_number, attemptId });
++    db.prepare('UPDATE reminder_attempts SET twilio_call_sid = ?, call_status = ? WHERE id = ?')
++      .run(call.sid, call.status, attemptId);
++    return 'placed';
++  } catch (err) {
++    const errors = a.error_count + 1;
++    db.prepare('UPDATE reminder_attempts SET error_count = ?, last_error = ? WHERE id = ?')
++      .run(errors, err.message, attemptId);
++    if (errors >= MAX_API_ERRORS) {
++      // The number is probably invalid or Twilio keeps rejecting it: count it as a failed attempt.
++      finalizeAttempt(attemptId, 'unanswered', { status: 'failed', error: err.message }, now);
++      return 'failed';
++    }
++    // Transient (network, config): put it back and try again on the next sweep.
++    db.prepare(`UPDATE reminder_attempts SET status = 'scheduled', placed_at = NULL, placed_on = NULL WHERE id = ?`).run(attemptId);
++    return 'retry-later';
++  }
++}
++
++function findDueAttempts(todayStr) {
++  return db.prepare(`
++    SELECT a.id, a.attempt_no, a.due_date, a.visit_id, v.label, p.full_name
++    FROM reminder_attempts a
++    JOIN visits v ON v.id = a.visit_id
++    JOIN patients p ON p.id = a.patient_id
++    WHERE a.status = 'scheduled' AND a.manual = 0 AND a.due_date <= ?
++      AND v.reminder_state = 'pending' AND v.attended IS NOT 1
++      AND p.study_group = 'intervention' AND p.consent_given = 1 AND p.active = 1
++      AND p.high_risk = 0 AND p.hearing_impairment = 0
++    ORDER BY a.due_date, v.visit_no, a.attempt_no
++  `).all(todayStr);
++}
++
++// Calls that never got a result (webhook lost, server restarted mid-call).
++async function reconcileStale(now = new Date()) {
++  if (telephony.isDryRun()) return; // dry-run calls are completed by hand
++  const staleBefore = iso(new Date(now.getTime() - STALE_AFTER_MIN * 60000));
++  const rows = db.prepare(`SELECT * FROM reminder_attempts WHERE status = 'dialing' AND placed_at < ?`).all(staleBefore);
++  for (const a of rows) {
++    const ageMin = (now.getTime() - new Date(a.placed_at).getTime()) / 60000;
++    if (!a.twilio_call_sid) {
++      if (ageMin >= NO_SID_AFTER_MIN && !a.manual) {
++        db.prepare(`UPDATE reminder_attempts SET status = 'scheduled', placed_at = NULL, placed_on = NULL WHERE id = ?`).run(a.id);
++      } else if (a.manual) {
++        db.prepare(`UPDATE reminder_attempts SET status = 'failed', completed_at = ? WHERE id = ?`).run(iso(now), a.id);
++      }
++      continue;
++    }
++    try {
++      const c = await telephony.fetchCall(a.twilio_call_sid);
++      if (c && TERMINAL.has(c.status)) { applyCallStatus(a.id, { status: c.status, duration: c.duration }, now); continue; }
++    } catch (err) {
++      console.error(`[reminders] could not fetch call ${a.twilio_call_sid}: ${err.message}`);
++    }
++    if (ageMin >= GIVE_UP_AFTER_MIN) {
++      finalizeAttempt(a.id, 'unanswered', { status: 'failed', error: 'No result received from Twilio' }, now);
++    }
++  }
++}
++
++let sweeping = false;
++
++// One pass of the scheduler: place every call that is due today.
++async function runSweep({ now = new Date(), ignoreHours = false } = {}) {
++  if (sweeping) return { skipped: 'already-running' };
++  sweeping = true;
++  try {
++    await reconcileStale(now);
++    const { date, hour } = dates.nowParts(now);
++    if (!ignoreHours && (hour < CALL_START_HOUR() || hour >= CALL_END_HOUR())) return { skipped: 'outside-calling-hours' };
++    const due = findDueAttempts(date);
++    const result = { due: due.length, placed: 0, failed: 0 };
++    for (const a of due) {
++      const r = await placeAttempt(a.id, now);
++      if (r === 'placed') { result.placed++; console.log(`[scheduler] Called ${a.full_name} — ${a.label}, attempt ${a.attempt_no}`); }
++      if (r === 'failed') result.failed++;
++    }
++    return result;
++  } finally {
++    sweeping = false;
++  }
++}
++
++// ---- staff actions --------------------------------------------------------
++
++// Place an extra call right now (staff clicked "Call now"); ignores the daily cap.
++async function manualCall(visitId, now = new Date()) {
++  const visit = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++  if (!visit) throw httpError(404, 'Visit not found');
++  const patient = db.prepare('SELECT * FROM patients WHERE id = ?').get(visit.patient_id);
++  if (!isCallable(patient)) throw httpError(400, 'This patient is not eligible for reminder calls (control group, excluded, withdrawn or no consent).');
++  if (['not_applicable', 'legacy'].includes(visit.reminder_state)) throw httpError(400, 'No reminders apply to this visit.');
++  if (visit.attended === 1) throw httpError(400, 'This visit is already marked as attended.');
++
++  const busy = db.prepare(`SELECT 1 FROM reminder_attempts WHERE visit_id = ? AND status = 'dialing'`).get(visitId);
++  if (busy) throw httpError(409, 'A call for this visit is already in progress.');
++
++  const todayStr = dates.today(now);
++  const attemptNo = db.prepare('SELECT COALESCE(MAX(attempt_no), 0) + 1 AS n FROM reminder_attempts WHERE visit_id = ?').get(visitId).n;
++  const id = db.prepare(`
++    INSERT INTO reminder_attempts (visit_id, patient_id, attempt_no, manual, due_date, status, placed_at, placed_on)
++    VALUES (?, ?, ?, 1, ?, 'dialing', ?, ?)
++  `).run(visitId, patient.id, attemptNo, todayStr, iso(now), todayStr).lastInsertRowid;
++
++  try {
++    const call = await telephony.placeCall({ to: patient.phone_number, attemptId: id });
++    db.prepare('UPDATE reminder_attempts SET twilio_call_sid = ?, call_status = ? WHERE id = ?').run(call.sid, call.status, id);
++    return { attemptId: Number(id), sid: call.sid, status: call.status };
++  } catch (err) {
++    db.prepare(`UPDATE reminder_attempts SET status = 'failed', last_error = ?, completed_at = ? WHERE id = ?`).run(err.message, iso(now), id);
++    throw httpError(400, err.message);
++  }
++}
++
++const markAttendance = db.transaction((visitId, attended, now = new Date()) => {
++  const v = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++  if (!v) throw httpError(404, 'Visit not found');
++  db.prepare('UPDATE visits SET attended = ? WHERE id = ?').run(attended === null ? null : attended ? 1 : 0, visitId);
++  if (attended) {
++    // She came — no more calls for this visit, and any open follow-up is closed.
++    db.prepare(`UPDATE reminder_attempts SET status = 'cancelled' WHERE visit_id = ? AND status = 'scheduled'`).run(visitId);
++    if (v.reminder_state === 'pending') {
++      db.prepare(`UPDATE visits SET reminder_state = 'closed' WHERE id = ?`).run(visitId);
++    } else if (v.reminder_state === 'not_responding' && !v.followup_resolved_at) {
++      db.prepare(`UPDATE visits SET followup_resolved_at = ?, followup_note = COALESCE(followup_note, 'Attended the visit') WHERE id = ?`).run(iso(now), visitId);
++    }
++  }
++  return db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++});
++
++function resolveFollowup(visitId, note, now = new Date()) {
++  const v = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++  if (!v) throw httpError(404, 'Visit not found');
++  if (v.reminder_state !== 'not_responding') throw httpError(400, 'This visit is not in the Not responding list.');
++  db.prepare('UPDATE visits SET followup_resolved_at = ?, followup_note = ? WHERE id = ?')
++    .run(iso(now), (note || '').trim() || 'Follow-up done', visitId);
++  return db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++}
++
++// Reopen a resolved follow-up (clicked "Resolve" by mistake).
++function reopenFollowup(visitId) {
++  const v = db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++  if (!v) throw httpError(404, 'Visit not found');
++  if (v.reminder_state !== 'not_responding') throw httpError(400, 'This visit is not in the Not responding list.');
++  db.prepare('UPDATE visits SET followup_resolved_at = NULL, followup_note = NULL WHERE id = ?').run(visitId);
++  return db.prepare('SELECT * FROM visits WHERE id = ?').get(visitId);
++}
++
++// ---- presentation helpers -------------------------------------------------
++
++// Adds a human-friendly `status` and `phase` to a visit row for the UI.
++function decorateVisit(v, attempts, todayStr) {
++  const phase = todayStr < v.window_start_date ? 'future' : todayStr <= v.window_end_date ? 'open' : 'past';
++  let status;
++  if (v.attended === 1) status = 'attended';
++  else if (v.attended === 0) status = 'missed';
++  else if (v.reminder_state === 'not_responding') status = v.followup_resolved_at ? 'followed_up' : 'not_responding';
++  else if (v.reminder_state === 'reached') status = 'reached';
++  else if (v.reminder_state === 'skipped') status = 'skipped';
++  else if (v.reminder_state === 'pending') status = attempts.some((a) => a.status !== 'scheduled' && a.status !== 'skipped') ? 'calling' : 'upcoming';
++  else status = phase === 'past' ? 'overdue' : phase === 'open' ? 'due_now' : 'upcoming';
++  return { ...v, tests: v.tests ? JSON.parse(v.tests) : [], phase, status, attempts };
++}
++
++function httpError(status, message) {
++  const e = new Error(message);
++  e.status = status;
++  return e;
++}
++
++module.exports = {
++  isCallable, generateVisits, applyCallStatus, finalizeAttempt, placeAttempt, findDueAttempts,
++  runSweep, reconcileStale, manualCall, markAttendance, resolveFollowup, reopenFollowup,
++  decorateVisit, httpError, MIN_ANSWER_SECONDS,
++};
+diff --git a/anc-reminder-system/services/telephony.js b/anc-reminder-system/services/telephony.js
+new file mode 100644
+index 0000000..513a9e4
+--- /dev/null
++++ b/anc-reminder-system/services/telephony.js
+@@ -0,0 +1,81 @@
++// Thin wrapper around Twilio so the rest of the app never touches the SDK.
++// DRY_RUN=true places no real calls (useful for demos and tests).
++const twilio = require('twilio');
++
++let client = null;
++let injected = false;
++
++function env() {
++  const e = process.env;
++  return {
++    sid: e.TWILIO_ACCOUNT_SID,
++    token: e.TWILIO_AUTH_TOKEN,
++    from: e.TWILIO_FROM_NUMBER,
++    base: (e.PUBLIC_BASE_URL || '').replace(/\/+$/, ''),
++    dryRun: e.DRY_RUN === 'true',
++  };
++}
++
++function isDryRun() { return env().dryRun; }
++
++function getClient() {
++  if (injected) return client;
++  const { sid, token } = env();
++  if (!sid || !token) return null;
++  if (!client) client = twilio(sid, token);
++  return client;
++}
++
++// Tests can inject a fake Twilio client.
++function setClientForTests(fake) { client = fake; injected = fake !== null; }
++
++function assertConfigured() {
++  const { from, base } = env();
++  if (!getClient()) {
++    throw new Error('Twilio is not configured. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN in .env (or DRY_RUN=true).');
++  }
++  if (!from) throw new Error('TWILIO_FROM_NUMBER is not set in .env');
++  if (!base) throw new Error('PUBLIC_BASE_URL is not set in .env');
++}
++
++let dryCounter = 0;
++
++// Place one reminder call. attemptId is echoed back on the status webhook so we
++// can match the result to the attempt even before the call SID is saved.
++async function placeCall({ to, attemptId }) {
++  const e = env();
++  if (e.dryRun) {
++    return { sid: `DRYRUN-${Date.now()}-${++dryCounter}`, status: 'queued' };
++  }
++  assertConfigured();
++  const call = await getClient().calls.create({
++    to,
++    from: e.from,
++    url: `${e.base}/api/voice/reminder?attempt=${attemptId}`,
++    method: 'POST',
++    statusCallback: `${e.base}/api/voice/status?attempt=${attemptId}`,
++    statusCallbackMethod: 'POST',
++    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
++    timeout: 30, // ring for 30s before counting it as no-answer
++  });
++  return { sid: call.sid, status: call.status };
++}
++
++// Ask Twilio for a call's current state (used if a status webhook never arrives).
++async function fetchCall(sid) {
++  if (env().dryRun) return null;
++  assertConfigured();
++  const c = await getClient().calls(sid).fetch();
++  return { status: c.status, duration: c.duration != null ? Number(c.duration) : null };
++}
++
++function validateWebhook(req) {
++  const { token, base, dryRun } = env();
++  if (dryRun || process.env.TWILIO_VALIDATE === 'false') return true;
++  if (!token) return false;
++  const signature = req.get('X-Twilio-Signature');
++  if (!signature) return false;
++  return twilio.validateRequest(token, signature, `${base}${req.originalUrl}`, req.body || {});
++}
++
++module.exports = { placeCall, fetchCall, isDryRun, isConfigured: () => { try { assertConfigured(); return true; } catch { return false; } }, validateWebhook, setClientForTests };
+diff --git a/anc-reminder-system/tests/flow.test.js b/anc-reminder-system/tests/flow.test.js
+new file mode 100644
+index 0000000..2315501
+--- /dev/null
++++ b/anc-reminder-system/tests/flow.test.js
+@@ -0,0 +1,160 @@
++// End-to-end test of the hospital reminder flow, using a throw-away database,
++// DRY_RUN (no Twilio) and a simulated clock.
++const os = require('os');
++const path = require('path');
++const fs = require('fs');
++const test = require('node:test');
++const assert = require('node:assert/strict');
++
++const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'anc-test-'));
++process.env.DB_PATH = path.join(tmp, 'test.db');
++process.env.DRY_RUN = 'true';
++process.env.APP_TIMEZONE = 'Asia/Kolkata';
++delete process.env.ADMIN_PASSWORD;
++
++const dates = require('../lib/dates');
++const { buildPlan, VISITS } = require('../config/schedule');
++const reminders = require('../services/reminders');
++const db = require('../db');
++const app = require('../server');
++
++let base;
++let server;
++test.before(async () => {
++  await new Promise((r) => { server = app.listen(0, r); });
++  base = `http://127.0.0.1:${server.address().port}/api`;
++});
++test.after(() => { server.close(); db.close(); });
++
++const api = async (method, url, body) => {
++  const res = await fetch(base + url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
++  return { status: res.status, body: await res.json().catch(() => null) };
++};
++const at = (ymd, time = '10:00:00') => new Date(`${ymd}T${time}+05:30`);
++const TODAY = dates.today();
++
++test('protocol matches the hospital sheet', () => {
++  assert.deepEqual(VISITS.map((v) => [v.startWeek, v.endWeek]),
++    [[6, 9], [10, 11], [14, 15], [20, 22], [26, 28], [30, 32], [34, 36]]);
++  // Visit 3: week 14, week 15, then the LAST call in week 16
++  const lmp = '2026-01-05';
++  const v3 = buildPlan(lmp).find((v) => v.visit_no === 3);
++  assert.deepEqual(v3.attempts.map((a) => a.due_date),
++    [dates.addDays(lmp, 98), dates.addDays(lmp, 105), dates.addDays(lmp, 112)]);
++  const v4 = buildPlan(lmp).find((v) => v.visit_no === 4);
++  assert.equal(v4.attempts[2].due_date, dates.addDays(lmp, 23 * 7)); // 22 + 1
++});
++
++test('enrolment validates input and builds 7 visits', async () => {
++  let r = await api('POST', '/patients', { registration_id: 'X1', full_name: 'A', phone_number: '123', study_group: 'intervention', consent_given: true, gestational_age_weeks: 5 });
++  assert.equal(r.status, 400);
++  r = await api('POST', '/patients', { registration_id: 'X1', full_name: 'A', phone_number: '9876543210', study_group: 'intervention', consent_given: true });
++  assert.equal(r.status, 400, 'needs LMP / EDD / GA');
++  r = await api('POST', '/patients', { registration_id: 'X1', full_name: 'A', phone_number: '9876543210', study_group: 'intervention', consent_given: false, gestational_age_weeks: 5 });
++  assert.equal(r.status, 400, 'intervention needs consent');
++  r = await api('POST', '/patients', { registration_id: 'X1', full_name: 'A', phone_number: '9876543210', study_group: 'intervention', consent_given: true, lmp_date: dates.addDays(TODAY, 3) });
++  assert.equal(r.status, 400, 'future LMP');
++  r = await api('POST', '/patients', { registration_id: 'REG-1', full_name: 'Test Mother', phone_number: '98765 43210', study_group: 'intervention', consent_given: true, gestational_age_weeks: 5 });
++  assert.equal(r.status, 201);
++  assert.equal(r.body.phone_number, '+919876543210');
++  assert.equal(r.body.visits.length, 7);
++  assert.equal(r.body.visits[2].attempts.length, 3);
++  r = await api('POST', '/patients', { registration_id: 'REG-1', full_name: 'Dup', phone_number: '9876543210', study_group: 'control', gestational_age_weeks: 5 });
++  assert.equal(r.status, 409);
++});
++
++test('3 unanswered calls -> Not responding; calls follow the sheet', async () => {
++  const p = db.prepare("SELECT * FROM patients WHERE registration_id = 'REG-1'").get();
++  const lmp = p.reference_lmp;
++  const placedDates = {};
++  for (let d = 0; d <= 120; d++) {
++    const day = dates.addDays(TODAY, d);
++    const res = await reminders.runSweep({ now: at(day) });
++    assert.ok(res.placed <= 1, 'never more than one call per patient per day');
++    for (const a of db.prepare("SELECT * FROM reminder_attempts WHERE status = 'dialing'").all()) {
++      (placedDates[a.visit_id] ||= []).push([a.attempt_no, day]);
++      reminders.applyCallStatus(a.id, { status: 'no-answer', duration: 0 }, at(day, '10:05:00'));
++    }
++  }
++  const v3 = db.prepare('SELECT * FROM visits WHERE patient_id = ? AND visit_no = 3').get(p.id);
++  assert.deepEqual(placedDates[v3.id], [
++    [1, dates.addDays(lmp, 98)], [2, dates.addDays(lmp, 105)], [3, dates.addDays(lmp, 112)],
++  ]);
++  assert.equal(v3.reminder_state, 'not_responding');
++  assert.ok(v3.flagged_at);
++
++  const list = (await api('GET', '/not-responding')).body;
++  assert.ok(list.some((x) => x.id === v3.id && x.full_name === 'Test Mother'));
++  assert.equal(list.find((x) => x.id === v3.id).attempts.length, 3);
++
++  // staff resolve -> leaves the open list, stays in history
++  assert.equal((await api('POST', `/visits/${v3.id}/resolve`, { note: 'Phoned husband' })).status, 200);
++  assert.ok(!(await api('GET', '/not-responding')).body.some((x) => x.id === v3.id));
++  assert.ok((await api('GET', '/not-responding?resolved=true')).body.some((x) => x.id === v3.id));
++});
++
++test('answered call stops further reminders for that visit', async () => {
++  const r = await api('POST', '/patients', { registration_id: 'REG-2', full_name: 'Answers', phone_number: '9123456780', study_group: 'intervention', consent_given: true, gestational_age_weeks: 5 });
++  const p = r.body;
++  const lmp = p.reference_lmp;
++  const v4 = db.prepare('SELECT * FROM visits WHERE patient_id = ? AND visit_no = 4').get(p.id);
++  for (let d = 0; d <= 150; d++) {
++    const day = dates.addDays(TODAY, d);
++    await reminders.runSweep({ now: at(day) });
++    for (const a of db.prepare("SELECT * FROM reminder_attempts WHERE status = 'dialing' AND patient_id = ?").all(p.id)) {
++      const answer = a.visit_id === v4.id && a.attempt_no === 2;
++      reminders.applyCallStatus(a.id, answer ? { status: 'completed', duration: 40 } : { status: 'no-answer', duration: 0 }, at(day, '10:05:00'));
++    }
++  }
++  const att = db.prepare('SELECT attempt_no, status FROM reminder_attempts WHERE visit_id = ? ORDER BY attempt_no').all(v4.id);
++  assert.deepEqual(att, [{ attempt_no: 1, status: 'unanswered' }, { attempt_no: 2, status: 'answered' }, { attempt_no: 3, status: 'cancelled' }]);
++  assert.equal(db.prepare('SELECT reminder_state FROM visits WHERE id = ?').get(v4.id).reminder_state, 'reached');
++  void lmp;
++});
++
++test('a hang-up under 10 seconds does not count as listened', () => {
++  const p = db.prepare("SELECT * FROM patients WHERE registration_id = 'REG-2'").get();
++  const v = db.prepare('SELECT id FROM visits WHERE patient_id = ? AND visit_no = 7').get(p.id);
++  const id = db.prepare("INSERT INTO reminder_attempts (visit_id, patient_id, attempt_no, manual, due_date, status, placed_at, placed_on) VALUES (?,?,?,?,?,'dialing',?,?)")
++    .run(v.id, p.id, 9, 1, TODAY, new Date().toISOString(), TODAY).lastInsertRowid;
++  reminders.applyCallStatus(Number(id), { status: 'completed', duration: 3 });
++  assert.equal(db.prepare('SELECT status FROM reminder_attempts WHERE id = ?').get(id).status, 'unanswered');
++});
++
++test('attendance closes the reminders; control group is never called', async () => {
++  const r = await api('POST', '/patients', { registration_id: 'REG-3', full_name: 'Attends', phone_number: '9000000001', study_group: 'intervention', consent_given: true, gestational_age_weeks: 1 });
++  const v = r.body.visits.find((x) => x.visit_no === 1);
++  const out = await api('PATCH', `/visits/${v.id}`, { attended: true });
++  assert.equal(out.status, 200);
++  assert.equal(db.prepare("SELECT COUNT(*) AS c FROM reminder_attempts WHERE visit_id = ? AND status = 'scheduled'").get(v.id).c, 0);
++  assert.equal(db.prepare('SELECT reminder_state FROM visits WHERE id = ?').get(v.id).reminder_state, 'closed');
++
++  const c = await api('POST', '/patients', { registration_id: 'REG-4', full_name: 'Control', phone_number: '9000000002', study_group: 'control', gestational_age_weeks: 1 });
++  assert.equal(c.status, 201);
++  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM reminder_attempts WHERE patient_id = ?').get(c.body.id).c, 0);
++});
++
++test('late enrolment: windows already open are not phoned', async () => {
++  const r = await api('POST', '/patients', { registration_id: 'REG-5', full_name: 'Late', phone_number: '9000000003', study_group: 'intervention', consent_given: true, gestational_age_weeks: 16 });
++  const states = Object.fromEntries(r.body.visits.map((v) => [v.visit_no, v.reminder_state]));
++  assert.deepEqual([states[1], states[2], states[3]], ['skipped', 'skipped', 'skipped']);
++  assert.equal(states[4], 'pending');
++});
++
++test('LMP correction rebuilds untouched visits only', async () => {
++  const r = await api('POST', '/patients', { registration_id: 'REG-6', full_name: 'Fix', phone_number: '9000000004', study_group: 'intervention', consent_given: true, lmp_date: dates.addDays(TODAY, -30) });
++  const before = r.body.visits.find((v) => v.visit_no === 3).window_start_date;
++  const u = await api('PATCH', `/patients/${r.body.id}`, { lmp_date: dates.addDays(TODAY, -37) });
++  assert.equal(u.status, 200);
++  assert.equal(u.body.visits.find((v) => v.visit_no === 3).window_start_date, dates.addDays(before, -7));
++  assert.equal(u.body.visits.length, 7);
++});
++
++test('dashboard, summary and csv endpoints respond', async () => {
++  for (const url of ['/dashboard', '/summary', '/config', '/protocol', '/patients?q=Test']) {
++    assert.equal((await api('GET', url)).status, 200, url);
++  }
++  const csv = await fetch(`${base}/export/visits.csv`);
++  assert.equal(csv.status, 200);
++  assert.match(await csv.text(), /registration_id/);
++});
