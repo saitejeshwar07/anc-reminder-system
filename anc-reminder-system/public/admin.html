@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ANC Voice Reminder — Admin</title>
+<link rel="stylesheet" href="admin.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">ANC</span>
+      <div>
+        <h1>Antenatal Voice Reminder Registry</h1>
+        <p class="subtitle">ICMR–STS 2026 · Prospective Interventional Study</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="enroll">Enroll patient</button>
+      <button class="tab-btn" data-tab="registry">Patient registry</button>
+      <button class="tab-btn" data-tab="summary">Study summary</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ENROLL TAB -->
+    <section id="tab-enroll" class="tab-panel active">
+      <form id="patient-form" class="card form-grid">
+        <h2>New patient enrollment</h2>
+
+        <div class="field">
+          <label for="registration_id">Hospital registration ID *</label>
+          <input id="registration_id" required placeholder="OBG-2026-0001" />
+        </div>
+        <div class="field">
+          <label for="full_name">Full name *</label>
+          <input id="full_name" required />
+        </div>
+        <div class="field">
+          <label for="age">Age</label>
+          <input id="age" type="number" min="12" max="55" />
+        </div>
+        <div class="field">
+          <label for="phone_number">Phone number (with country code) *</label>
+          <input id="phone_number" required placeholder="+91XXXXXXXXXX" />
+        </div>
+        <div class="field">
+          <label for="language">Reminder language</label>
+          <select id="language">
+            <option value="or" selected>Odia</option>
+            <option value="hi">Hindi</option>
+            <option value="en">English</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="study_group">Study group *</label>
+          <select id="study_group" required>
+            <option value="intervention">Intervention (receives voice reminders)</option>
+            <option value="control">Control (routine instructions only)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="lmp_date">LMP date</label>
+          <input id="lmp_date" type="date" />
+        </div>
+        <div class="field">
+          <label for="edd_date">EDD date</label>
+          <input id="edd_date" type="date" />
+        </div>
+        <div class="field">
+          <label for="gestational_age_weeks">Gestational age at registration (weeks)</label>
+          <input id="gestational_age_weeks" type="number" min="0" max="20" />
+        </div>
+
+        <div class="field">
+          <label for="height_cm">Height (cm)</label>
+          <input id="height_cm" type="number" step="0.1" />
+        </div>
+        <div class="field">
+          <label for="weight_kg">Weight (kg)</label>
+          <input id="weight_kg" type="number" step="0.1" />
+        </div>
+        <div class="field">
+          <label for="occupation">Occupation</label>
+          <input id="occupation" />
+        </div>
+
+        <div class="field field-wide">
+          <label for="obstetric_history">Obstetric history</label>
+          <textarea id="obstetric_history" rows="2"></textarea>
+        </div>
+        <div class="field field-wide">
+          <label for="personal_history">Personal history</label>
+          <textarea id="personal_history" rows="2"></textarea>
+        </div>
+
+        <div class="field checkbox-field">
+          <label><input type="checkbox" id="consent_given" /> Written informed consent obtained *</label>
+        </div>
+        <div class="field checkbox-field">
+          <label><input type="checkbox" id="high_risk" /> High-risk pregnancy (exclusion)</label>
+        </div>
+        <div class="field checkbox-field">
+          <label><input type="checkbox" id="hearing_impairment" /> Hearing impairment (exclusion)</label>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="btn-primary">Enroll patient</button>
+          <span id="enroll-status" class="status-msg"></span>
+        </div>
+      </form>
+
+      <div class="card" id="visit-card" style="display:none;">
+        <h2>Schedule visits / investigations for <span id="visit-patient-name"></span></h2>
+        <form id="visit-form" class="form-grid">
+          <div class="field">
+            <label for="visit_type">Type *</label>
+            <select id="visit_type" required>
+              <option value="anc_visit">ANC visit</option>
+              <option value="investigation">Investigation</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="visit_label">Label *</label>
+            <input id="visit_label" required placeholder="e.g. ANC Visit 2 / Ultrasound (2nd trimester)" />
+          </div>
+          <div class="field">
+            <label for="scheduled_date">Scheduled date *</label>
+            <input id="scheduled_date" type="date" required />
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn-secondary">Add visit</button>
+          </div>
+        </form>
+        <table class="mini-table" id="visit-table">
+          <thead><tr><th>Type</th><th>Label</th><th>Date</th><th>Reminder due</th><th>Sent?</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- REGISTRY TAB -->
+    <section id="tab-registry" class="tab-panel">
+      <div class="card">
+        <div class="registry-header">
+          <h2>Patient registry</h2>
+          <select id="filter-group">
+            <option value="">All groups</option>
+            <option value="intervention">Intervention</option>
+            <option value="control">Control</option>
+          </select>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Reg. ID</th><th>Name</th><th>Phone</th><th>Group</th><th>Consent</th><th>Enrolled</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="registry-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- SUMMARY TAB -->
+    <section id="tab-summary" class="tab-panel">
+      <div class="card">
+        <h2>Adherence summary</h2>
+        <table class="data-table" id="summary-table">
+          <thead><tr><th>Group</th><th>Patients</th><th>Attended</th><th>Missed</th><th>Pending</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Call outcomes</h2>
+        <table class="data-table" id="call-summary-table">
+          <thead><tr><th>Status</th><th>Count</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="admin.js"></script>
+</body>
+</html>

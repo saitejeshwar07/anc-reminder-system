@@ -1,0 +1,20 @@
+{
+  "name": "anc-reminder-system",
+  "version": "1.0.0",
+  "description": "AI-assisted voice reminder system for antenatal care follow-up (ICMR STS 2026 study)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "twilio": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
